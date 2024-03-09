@@ -68,11 +68,6 @@ impl<T> DirectedAcyclicGraph<T> {
         result.value
     }
 
-    #[allow(unused)]
-    pub fn nodes(&self) -> impl '_ + Iterator<Item = NodeId> {
-        self.nodes.iter().map(|(id, _)| NodeId(id as u16))
-    }
-
     pub fn children(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
         DirectedAcyclicGraphIter {
             graph: self,

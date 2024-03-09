@@ -46,7 +46,7 @@ pub trait Kind: 'static + Send + Sync {
     type FormatDescriptor: Send + Sync;
 
     /// A structure which describes the parts of a format that have changed.
-    type UsageDescriptor: Send + Sync;
+    type UsageDescriptor: Send + Sync + Sized;
 }
 
 /// A certain format of data.
@@ -71,7 +71,7 @@ pub trait DerivedDescriptor<F: Format>: 'static + Send + Sync + Sized {
 
 /// A type-erased instance of [`View`] that is used to specify
 /// data usage in a [`CommandDescriptor`].
-pub trait ViewUsage: 'static + Send + Sync + ViewUsageInner {}
+pub trait ViewUsage: Send + Sync + ViewUsageInner {}
 
 /// Determines how a new data object will be allocated.
 pub struct AllocationDescriptor<'a, F: Format> {
@@ -107,7 +107,7 @@ impl CommandBuffer {
     }
 
     /// Maps a format for synchronous viewing.
-    pub fn map<M: Mutability, F: Format>(&mut self, view: &View<M, F>) -> Mapped<M, F> {
+    pub fn map<M: UsageMutability, F: Format>(&mut self, view: &ViewDescriptor<M, F>) -> Mapped<M, F> {
         let inner = Arc::new(MappedInner::default());
     
         let computation = SyncUnsafeCell::new(Some(Computation::Map { inner: Some(inner.clone()) }));
@@ -124,7 +124,8 @@ impl CommandBuffer {
 
         Mapped {
             inner,
-            view: view.clone()
+            view: view.view.clone(),
+            marker: PhantomData
         }
     }
 
@@ -203,23 +204,23 @@ pub struct CommandContext {
 
 impl CommandContext {
     /// Immutably gets the data referenced by the view.
-    pub fn get<M: Mutability, F: Format>(&self, view: &View<M, F>) -> ViewRef<Const, F> {
+    pub fn get<F: Format>(&self, view: &View<F>) -> ViewRef<Const, F> {
         ViewRef {
-            reference: self.find_view(view).borrow(),
+            reference: self.find_view::<Const, _>(view).borrow(),
             marker: PhantomData
         }
     }
 
     /// Mutably gets the data referenced by the view, and records the usage for updating derived formats.
     /// This function will panic if `view` refers to a derived format.
-    pub fn get_mut<F: Format>(&self, view: &View<Mut, F>, _: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<Mut, F> {
+    pub fn get_mut<F: Format>(&self, view: &View<F>) -> ViewRef<Mut, F> {
         ViewRef {
-            reference: self.find_view(view).borrow_mut(),
+            reference: self.find_view::<Mut, _>(view).borrow_mut(),
             marker: PhantomData
         }
     }
 
-    fn find_view<M: Mutability, F: Format>(&self, view: &View<M, F>) -> &RwCell<*mut ()> {
+    fn find_view<M: Mutability, F: Format>(&self, view: &View<F>) -> &RwCell<*mut ()> {
         let mutable = TypeId::of::<Mut>() == TypeId::of::<M>();
         if let Some(command_view) = self.views.iter().find(|x| x.id == view.id && x.mutable == mutable) {
             &command_view.value
@@ -282,13 +283,13 @@ impl<K: Kind> Data<K> {
     /// then the format must be the primary format. Using views with invalid
     /// mutability or formats will lead to panics when [`DataFrostContext::submit`]
     /// is called.
-    pub fn view<M: Mutability, F: Format<Kind = K>>(&self) -> View<M, F> {
-        let id = if TypeId::of::<F>() == self.inner.format_id {
-            self.inner.id
+    pub fn view<F: Format<Kind = K>>(&self) -> View<F> {
+        let (id, derived) = if TypeId::of::<F>() == self.inner.format_id {
+            (self.inner.id, false)
         }
         else if let Some((_, id)) = self.inner.derived_formats.iter().copied().find(|&(id, _)| id == TypeId::of::<F>()) {
-            assert!(TypeId::of::<M>() == TypeId::of::<Const>(), "Attempted to mutably access derived format {} of object{}", type_name::<F>(), FormattedLabel(" ", self.inner.label, ""));
-            id
+            //assert!(TypeId::of::<M>() == TypeId::of::<Const>(), "Attempted to mutably access derived format {} of object{}", type_name::<F>(), FormattedLabel(" ", self.inner.label, ""));
+            (id, true)
         }
         else {
             panic!("Derived format {} of object{} did not exist", type_name::<F>(), FormattedLabel(" ", self.inner.label, ""))
@@ -297,6 +298,7 @@ impl<K: Kind> Data<K> {
         View {
             inner: self.clone(),
             id,
+            derived,
             marker: PhantomData
         }
     }
@@ -344,6 +346,7 @@ impl DataFrostContext {
         let (object_update_sender, object_updates) = channel();
 
         let change_notifier = ChangeNotifier::default();
+        let change_listener = CondvarNotificationListener::new(&change_notifier);
         let context_id = unique_id();
         let inner = Mutex::new(ContextInner {
             active_command_buffers: Slab::new(),
@@ -361,6 +364,7 @@ impl DataFrostContext {
 
         let holder = Arc::new(ContextHolder {
             change_notifier,
+            change_listener,
             context_id,
             inner
         });
@@ -376,21 +380,23 @@ impl DataFrostContext {
         self.inner().allocate(descriptor)
     }
 
-    /// Immutably gets the data referenced by the mapping. This function will block if the mapping
-    /// is not yet available.
+    /// Immutably gets the data referenced by the mapping. This function will block if the mapping is not yet available.
     pub fn get<'a, M: Mutability, F: Format>(&self, mapping: &'a Mapped<M, F>) -> ViewRef<'a, Const, F> {
         unsafe {
             assert!(mapping.inner.context_id.load(Ordering::Acquire) == self.holder.context_id, "Mapping was not from this context.");
 
-            while !mapping.inner.mapped.load(Ordering::Acquire) {
+            if !mapping.inner.mapped.load(Ordering::Acquire) {
                 let mut inner = self.inner();
-                match inner.prepare_next_command(&self.holder) {
-                    Some(Some(command)) => {
-                        drop(inner);
-                        command.execute();
-                    },
-                    Some(None) => continue,
-                    None => todo!("somehow block"),
+                while !mapping.inner.mapped.load(Ordering::Acquire) {
+                    match inner.prepare_next_command(&self.holder) {
+                        Some(Some(command)) => {
+                            drop(inner);
+                            command.execute();
+                            inner = self.inner();
+                        },
+                        Some(None) => continue,
+                        None => inner = self.holder.change_listener.wait(inner),
+                    }
                 }
             }
             
@@ -398,11 +404,28 @@ impl DataFrostContext {
         }
     }
 
-    /// Mutably gets the data referenced by the mapping, and records the usage for updating derived formats.
-    /// This function will block if the mapping is not yet available.
-    /// This function will panic if `view` refers to a derived format.
-    pub fn get_mut<'a, F: Format>(&self, _: &'a mut Mapped<Mut, F>, _: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<'a, Mut, F> {
-        todo!()
+    /// Mutably gets the data referenced by the mapping. This function will block if the mapping is not yet available.
+    pub fn get_mut<'a, F: Format>(&self, mapping: &'a mut Mapped<Mut, F>) -> ViewRef<'a, Mut, F> {
+        unsafe {
+            assert!(mapping.inner.context_id.load(Ordering::Acquire) == self.holder.context_id, "Mapping was not from this context.");
+
+            if !mapping.inner.mapped.load(Ordering::Acquire) {
+                let mut inner = self.inner();
+                while !mapping.inner.mapped.load(Ordering::Acquire) {
+                    match inner.prepare_next_command(&self.holder) {
+                        Some(Some(command)) => {
+                            drop(inner);
+                            command.execute();
+                            inner = self.inner();
+                        },
+                        Some(None) => continue,
+                        None => inner = self.holder.change_listener.wait(inner),
+                    }
+                }
+            }
+            
+            return (*mapping.inner.command_context.get()).assume_init_mut().get_mut(&mapping.view);
+        }
     }
 
     /// Schedules the provided command buffer for execution.
@@ -478,57 +501,83 @@ impl<F: Format> std::fmt::Debug for Derived<F> {
 
 pub struct Mapped<M: Mutability, F: Format> {
     inner: Arc<MappedInner>,
-    view: View<M, F>
+    view: View<F>,
+    marker: PhantomData<fn() -> M>
 }
 
 /// References a specified format underlying a [`Data`] instance.
-pub struct View<M: Mutability, F: Format> {
+pub struct View<F: Format> {
     /// The inner representation of this object.
     inner: Data<F::Kind>,
     /// The index to which this format refers.
     id: u32,
+    /// Whether this is a derived format.
+    derived: bool,
     /// A marker for generic bounds.
-    marker: PhantomData<fn() -> (M, F)>
+    marker: PhantomData<fn() -> F>
 }
 
-impl<M: Mutability, F: Format> View<M, F> {
+impl<F: Format> View<F> {
+    pub fn as_const(&self) -> ViewDescriptor<Const, F> {
+        ViewDescriptor {
+            view: self,
+            descriptor: SyncUnsafeCell::new(Some(())),
+            taken: AtomicBool::new(false)
+        }
+    }
+
+    pub fn as_mut(&self, usage: <F::Kind as Kind>::UsageDescriptor) -> ViewDescriptor<Mut, F> {
+        ViewDescriptor {
+            view: self,
+            descriptor: SyncUnsafeCell::new(Some(usage)),
+            taken: AtomicBool::new(false)
+        }
+    }
+
     /// Gets the data to which this view refers.
     pub fn data(&self) -> &Data<F::Kind> {
         &self.inner
     }
 }
 
-impl<M: Mutability, F: Format> Clone for View<M, F> {
+impl<F: Format> Clone for View<F> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             id: self.id,
+            derived: self.derived,
             marker: PhantomData
         }
     }
 }
 
-impl<M: Mutability, F: Format> std::fmt::Debug for View<M, F> where <F::Kind as Kind>::FormatDescriptor: std::fmt::Debug {
+impl<F: Format> std::fmt::Debug for View<F> where <F::Kind as Kind>::FormatDescriptor: std::fmt::Debug {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("View")
-            .field(&type_name::<M>())
             .field(&type_name::<F>())
             .field(&self.inner)
             .finish()
     }
 }
 
-impl<M: Mutability, F: Format> ViewUsage for View<M, F> {}
-
-impl<M: Mutability, F: Format> ViewUsageInner for View<M, F> {
-    fn add_to_list(&self, command_list: &mut DynVec) -> DynEntry<dyn ViewHolder> {
-        command_list.push(self.clone())
-    }
+pub struct ViewDescriptor<'a, M: UsageMutability, F: Format> {
+    view: &'a View<F>,
+    descriptor: SyncUnsafeCell<Option<M::Descriptor<F>>>,
+    taken: AtomicBool
 }
 
-pub struct ViewDescriptor<'a, M: UsageMutability, F: Format> {
-    view: &'a View<M, F>,
-    descriptor: M::Descriptor<F>
+impl<'a, M: UsageMutability, F: Format> ViewUsage for ViewDescriptor<'a, M, F> {}
+
+impl<'a, M: UsageMutability, F: Format> ViewUsageInner for ViewDescriptor<'a, M, F> {
+    fn add_to_list(&self, command_list: &mut DynVec) -> DynEntry<dyn ViewHolder> {
+        unsafe {
+            assert!(!self.taken.swap(true, Ordering::Relaxed), "Attempted to reuse view descriptor{}", FormattedLabel(" ", self.view.inner.inner.label, ""));
+            command_list.push(TypedViewHolder::<M, F> {
+                view: self.view.clone(),
+                descriptor: take(&mut *self.descriptor.get()).unwrap_unchecked()
+            })
+        }
+    }
 }
 
 /// A guard which allows access to the data of a format.
@@ -565,7 +614,7 @@ impl<'a, F: Format> DerefMut for ViewRef<'a, Mut, F> {
 trait DerivedFormatUpdater: 'static + Send + Sync {
     unsafe fn allocate(&self, descriptor: *const ()) -> Box<UnsafeCell<dyn Any + Send + Sync>>;
     fn format_type_id(&self) -> TypeId;
-    unsafe fn update(&self, context: CommandContext);
+    unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]);
 }
 
 trait ExecutableCommand: 'static + Send + Sync {
@@ -576,25 +625,12 @@ trait ViewHolder: 'static + Send + Sync {
     fn context_id(&self) -> u64;
     fn id(&self) -> u32;
     fn mutable(&self) -> bool;
+    fn usage(&self) -> *const ();
 }
 
 impl<F: 'static + Send + Sync + FnOnce(CommandContext)> ExecutableCommand for SyncUnsafeCell<Option<F>> {
     unsafe fn execute(&self, ctx: CommandContext) {
         take(&mut *self.get()).unwrap_unchecked()(ctx);
-    }
-}
-
-impl<M: Mutability, F: Format> ViewHolder for View<M, F> {
-    fn context_id(&self) -> u64 {
-        self.inner.inner.context_id
-    }
-
-    fn id(&self) -> u32 {
-        self.id
-    }
-
-    fn mutable(&self) -> bool {
-        TypeId::of::<M>() == TypeId::of::<Mut>()
     }
 }
 
@@ -626,7 +662,8 @@ enum Computation {
         inner: Option<Arc<MappedInner>>
     },
     Update {
-        object: u32
+        object: u32,
+        updates: Vec<(Arc<DynVec>, DynEntry<dyn ViewHolder>)>
     }
 }
 
@@ -635,17 +672,41 @@ struct ComputationNode {
     pub command_buffer: u16,
     pub derived_update: Option<DerivedFormatUpdate>,
     pub label: Option<&'static str>,
-    pub views: Vec<ComputationViewReference>,
-    pub desc: &'static str
+    pub views: Vec<ComputationViewReference>
 }
 
 struct ComputationViewReference {
     pub id: u32,
-    pub mutable: bool
+    pub mutable: bool,
+    pub view_holder: DynEntry<dyn ViewHolder>
+}
+
+struct CondvarNotificationListener {
+    #[allow(unused)]
+    handle: ChangeNotificationListener,
+    inner: Arc<Condvar>,
+}
+
+impl CondvarNotificationListener {
+    pub fn new(notifier: &ChangeNotifier) -> Self {
+        let inner = Arc::new(Condvar::new());
+        let inner_clone = inner.clone();
+        let handle = notifier.add_listener(move || inner_clone.notify_all());
+
+        Self {
+            handle,
+            inner
+        }
+    }
+
+    pub unsafe fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        self.inner.wait(guard).unwrap_unchecked()
+    }
 }
 
 struct ContextHolder {
     change_notifier: ChangeNotifier,
+    change_listener: CondvarNotificationListener,
     context_id: u64,
     inner: Mutex<ContextInner>
 }
@@ -775,7 +836,7 @@ impl ContextInner {
                         value.mapped.store(true, Ordering::Release);
                         Some(None)
                     },
-                    Computation::Update { object } => {
+                    Computation::Update { object, updates } => {
                         let derived = *object;
                         let value = &self.objects[derived as usize];
                         let FormatDeriveState::Derived { updater, parent, index, .. } = &value.derive_state 
@@ -798,7 +859,12 @@ impl ContextInner {
                             format_state.next_update = None;
                         }
 
-                        Some(Some(Box::new(move || updater.update(ctx))))
+                        let updates = take(updates);
+                        Some(Some(Box::new(move || {
+                            let mut update_list = Vec::with_capacity(updates.len());
+                            update_list.extend(updates.iter().map(|(buffer, entry)| buffer[*entry].usage()));
+                            updater.update(ctx, transmute(&update_list[..]));
+                        })))
                     },
                 }
             }
@@ -852,7 +918,7 @@ impl ContextInner {
 
     fn schedule_command(&mut self, command_buffer_id: u16, command_buffer_label: Option<&'static str>, computation: Computation, label: Option<&'static str>, first_view_entry: Option<DynEntry<ViewEntry>>) -> bool {
         unsafe {
-            let command_buffer =  &self.active_command_buffers[command_buffer_id as usize].command_list;
+            let command_buffer = self.active_command_buffers[command_buffer_id as usize].command_list.clone();
             let node = self.compute_graph.vacant_node();
 
             // Iterate over all used views to find any conflicting computations
@@ -867,6 +933,7 @@ impl ContextInner {
                 assert!(next_view.context_id() == self.context_id, "View did not belong to this context.");
                 views.push(ComputationViewReference {
                     id: next_view.id(),
+                    view_holder: next.view,
                     mutable: next_view.mutable()
                 });
 
@@ -919,7 +986,6 @@ impl ContextInner {
 
             // Add the new computation to the graph
             self.compute_graph.insert(ComputationNode {
-                desc: if matches!(computation, Computation::Map { .. }) { "map" } else { "compu" },
                 computation: computation.clone(),
                 command_buffer: command_buffer_id as u16,
                 derived_update: None,
@@ -933,31 +999,34 @@ impl ContextInner {
             for i in 0..self.compute_graph[node].views.len() {
                 let view = &self.compute_graph[node].views[i];
                 let view_id = view.id;
+                let view_holder = view.view_holder;
                 let mutable = view.mutable;
                 let object = &mut self.objects[view.id as usize];
                 let mut derived_nodes_to_add = Vec::new();
                 match &mut object.derive_state {
                     FormatDeriveState::Base { derived_formats } => if mutable {
                         for (index, format) in derived_formats.iter_mut().enumerate() {
-                            if let Some(derived) = format.next_update {
+                            let derived = if let Some(derived) = format.next_update {
                                 self.compute_graph.add_parent(node, derived);
                                 self.top_level_nodes.set(derived, false);
+                                derived
                             }
                             else {
                                 let derived_computation = self.compute_graph.insert(ComputationNode {
-                                    computation: Computation::Update { object: format.id },
+                                    computation: Computation::Update { object: format.id, updates: Vec::with_capacity(1) },
                                     command_buffer: command_buffer_id as u16,
                                     derived_update: Some(DerivedFormatUpdate {
                                         parent: view_id,
                                         index: index as u32
                                     }),
-                                    desc: "update",
                                     label: None,
                                     views: vec!(ComputationViewReference {
                                         id: view_id,
+                                        view_holder: view_holder,
                                         mutable: false
                                     }, ComputationViewReference {
                                         id: format.id,
+                                        view_holder: view_holder,
                                         mutable: true
                                     })
                                 }, &[node]);
@@ -965,7 +1034,16 @@ impl ContextInner {
                                 object.immutable_references.push(derived_computation);
                                 derived_nodes_to_add.push((format.id, derived_computation));
                                 self.active_command_buffers[command_buffer_id as usize].remaining_commands += 1;
-                            }
+                                println!("ADD {derived_computation:?}");
+                                derived_computation
+                            };
+
+                            let Computation::Update { updates, .. } = &mut self.compute_graph[derived].computation
+                            else {
+                                unreachable!();
+                            };
+
+                            updates.push((command_buffer.clone(), view_holder));
                         }
                     },
                     &mut FormatDeriveState::Derived { parent, index, .. } => {
@@ -1007,13 +1085,6 @@ impl ContextInner {
                 self.temporary_node_buffer.extend(self.compute_graph.parents(parent));
                 self.critical_nodes.set(parent, true);
             }
-        }
-    }
-
-    #[allow(unused)]
-    fn print_graph(&self) {
-        for node in self.compute_graph.nodes() {
-            println!("{node:?} {} => {:?}", self.compute_graph[node].desc, self.compute_graph.children(node).collect::<Vec<_>>());
         }
     }
 
@@ -1094,7 +1165,7 @@ struct DerivedFormatState {
 
 enum FormatDeriveState {
     Base {
-        derived_formats: Vec<DerivedFormatState>
+        derived_formats: Vec<DerivedFormatState>,
     },
     Derived {
         parent: u32,
@@ -1168,8 +1239,31 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
         TypeId::of::<D::Format>()
     }
 
-    unsafe fn update(&self, context: CommandContext) {
-        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[1].value.borrow().cast(), &[]);
+    unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]) {
+        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[1].value.borrow().cast(), transmute(usages));
+    }
+}
+
+struct TypedViewHolder<M: UsageMutability, F: Format> {
+    view: View<F>,
+    descriptor: M::Descriptor<F>,
+}
+
+impl<M: UsageMutability, F: Format> ViewHolder for TypedViewHolder<M, F> {
+    fn context_id(&self) -> u64 {
+        self.view.inner.inner.context_id
+    }
+
+    fn id(&self) -> u32 {
+        self.view.id
+    }
+
+    fn mutable(&self) -> bool {
+        TypeId::of::<M>() == TypeId::of::<Mut>()
+    }
+
+    fn usage(&self) -> *const () {
+        &self.descriptor as *const _ as *const _
     }
 }
 
@@ -1182,7 +1276,7 @@ mod private {
     }
 
     pub trait UsageMutability: Mutability {
-        type Descriptor<F: Format>;
+        type Descriptor<F: Format>: Send + Sync;
     }
 
     impl UsageMutability for Const {
@@ -1250,10 +1344,8 @@ mod tests {
         type Format = DoubledInt32;
 
         fn update(&self, data: &mut Self::Format, parent: &Int32, usages: &[&u32]) {
-            println!("UPDATE DESC {data:?} {parent:?}");
-            for &&x in usages {
-                data.0 += 2 * x as i32;
-            }
+            data.0 = 2 * parent.0;
+            println!("{usages:?}");
         }
     }
 
@@ -1268,13 +1360,12 @@ mod tests {
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view_a = data.view::<Const, Int32>();
-        let view_b = data.view::<Mut, Int32>();
+        let view = data.view::<Int32>();
 
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
+            views: &[&view.as_const(), &view.as_mut(25)],
             command: |_| {},
-            views: &[&view_a, &view_b]
         });
 
         ctx.submit(Some(command_buffer));
@@ -1290,13 +1381,13 @@ mod tests {
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view_a = data.view::<Const, Int32>();
-        let view_b = data.view::<Const, Int32>();
+        let view_a = data.view::<Int32>();
+        let view_b = data.view::<Int32>();
 
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
             command: |_| {},
-            views: &[&view_a, &view_b]
+            views: &[&view_a.as_const(), &view_b.as_const()]
         });
 
         ctx.submit(Some(command_buffer));
@@ -1312,41 +1403,41 @@ mod tests {
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view = data.view::<Mut, Int32>();
+        let view = data.view::<Int32>();
         
         let view_clone = view.clone();
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
             command: move |ctx| {
-                let mut vc = ctx.get_mut(&view_clone, 4);
+                let mut vc = ctx.get_mut(&view_clone);
                 println!("Execute {vc:?}");
                 vc.0 += 4;
             },
-            views: &[&view]
+            views: &[&view.as_mut(4)]
         });
 
-        let mapping1 = command_buffer.map(&data.view::<Const, DoubledInt32>());
+        //let mapping1 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
         
         if true {
             let view_clone = view.clone();
             command_buffer.schedule(CommandDescriptor {
                 label: Some("Test command"),
                 command: move |ctx| {
-                    let mut vc = ctx.get_mut(&view_clone, 2);
+                    let mut vc = ctx.get_mut(&view_clone);
                     println!("Execute2 {vc:?}");
                     vc.0 += 2;
                 },
-                views: &[&view]
+                views: &[&view.as_mut(2)]
             });
         }
 
-        let mapping2 = command_buffer.map(&data.view::<Const, DoubledInt32>());
+        let mapping2 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
         ctx.submit(Some(command_buffer));
 
-        let value = ctx.get(&mapping1);
-        println!("Mapped {}", value.0);
-        drop(value);
-        drop(mapping1);
+        //let value = ctx.get(&mapping1);
+        //println!("Mapped {}", value.0);
+        //drop(value);
+        //drop(mapping1);
         let value = ctx.get(&mapping2);
         println!("Mapped {}", value.0);
         drop(value);
