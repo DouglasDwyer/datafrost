@@ -10,7 +10,114 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_docs_in_private_items)]
 
-//! Crate docs
+//! #### Data format and acceleration structure management
+//! 
+//! `datafrost` is a data-oriented resource management and scheduling library. It implements a graphics API-inspired interface that allows one to cleanly and efficiently:
+//! 
+//! - Create primary data objects, and define "derived" datatypes whose contents are generated from the primary format.
+//! - Track how a primary object changes and automatically update the affected parts of the derived formats.
+//! - Schedule commands to asynchronously and concurrently read or modify data objects.
+//!   - `datafrost` guarantees optimal scheduling by building a directed acyclic graph to represent pending operations.
+//!   - Multiple commands which reference different data, or immutably reference the same data, will execute in parallel.
+//!   - Commands which mutably access the same data run in sequence, without the possibility of data races. 
+//! - Map the contents of data objects and read their results on the main thread.
+//! 
+//! ## Usage
+//! 
+//! The following is an abridged example of how to use `datafrost`. The full code may be found in the
+//! [examples folder](/examples/derived.rs). To begin, we define the data formats that our code will use:
+//! 
+//! ```rust
+//! use datafrost::*;
+//! use std::ops::*;
+//! 
+//! /// First, we define a general "kind" of data that our program will use.
+//! /// In this case, let's imagine that we want to efficiently deal with
+//! /// arrays of numbers.
+//! pub struct NumberArray;
+//! 
+//! /// Defines the layout of an array of numbers.
+//! pub struct NumberArrayDescriptor {
+//!     /// The length of the array.
+//!     pub len: usize
+//! }
+//! 
+//! impl Kind for NumberArray { .. }
+//! 
+//! /// Next, we define the primary data format that we would like
+//! /// to use and modify - an array of specifically `u32`s.
+//! pub struct PrimaryArray(Vec<u32>);
+//! 
+//! impl Format for PrimaryArray { .. }
+//! 
+//! /// Now, let's imagine that we want to efficiently maintain an
+//! /// acceleration structure containing all of the numbers in
+//! /// the array, but doubled. So, we define the format.
+//! pub struct DoubledArray(Vec<u32>);
+//! 
+//! impl Format for DoubledArray { .. }
+//! 
+//! /// Our goal is for `datafrost` to automatically update the doubled
+//! /// array whenever the primary array changes. Thus, we implement
+//! /// a way for it do so.
+//! pub struct DoublePrimaryArray;
+//! 
+//! impl DerivedDescriptor<PrimaryArray> for DoublePrimaryArray {
+//!     type Format = DoubledArray;
+//! 
+//!     fn update(&self, data: &mut DoubledArray, parent: &PrimaryArray, usages: &[&Range<usize>]) {
+//!         // Loop over all ranges of the array that have changed, and
+//!         // for each value in the range, recompute the data.
+//!         for range in usages.iter().copied() {
+//!             for i in range.clone() {
+//!                 data.0[i] = 2 * parent.0[i];
+//!             }
+//!         }
+//!     }
+//! }
+//! ```
+//! 
+//! Now that our data and its derived formats are defined, we can create instances of
+//! it and schedule commands to act upon the data:
+//! 
+//! ```rust
+//! // Create a new context.
+//! let ctx = DataFrostContext::new(ContextDescriptor {
+//!     label: Some("my context")
+//! });
+//! 
+//! // Allocate a new primary array object, which has a doubled
+//! // array as a derived format.
+//! let data = ctx.allocate::<PrimaryArray>(AllocationDescriptor {
+//!     descriptor: NumberArrayDescriptor { len: 7 },
+//!     label: Some("my data"),
+//!     derived_formats: &[&Derived::new(DoublePrimaryArray)]
+//! });
+//! 
+//! // Create a command buffer to record operations to execute
+//! // on our data.
+//! let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
+//! 
+//! // Schedule a command to fill the primary number array with some data.
+//! let view = data.view::<PrimaryArray>();
+//! let view_clone = view.clone();
+//! command_buffer.schedule(CommandDescriptor {
+//!     label: Some("fill array"),
+//!     views: &[&view.as_mut(4..6)],
+//!     command: move |ctx| ctx.get_mut(&view_clone).0[4..6].fill(33)
+//! });
+//! 
+//! // Schedule a command to map the contents of the derived acceleration structure
+//! // so that we may view them synchronously.
+//! let derived = command_buffer.map(&data.view::<DoubledArray>().as_const());
+//! 
+//! // Submit the buffer for processing.
+//! ctx.submit(Some(command_buffer));
+//! 
+//! // The doubled acceleration structure automatically contains the
+//! // correct, up-to-date data!
+//! assert_eq!(&[0, 0, 0, 0, 66, 66, 0], &ctx.get(&derived).0[..]);
+//! ```
 
 use crate::dyn_vec::*;
 use crate::graph::*;
@@ -1468,22 +1575,22 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    pub struct IntDescriptor {
+    pub struct DataDescriptor {
         pub initial_value: u32
     }
 
-    pub struct Int;
+    pub struct MyData;
 
-    impl Kind for Int {
-        type FormatDescriptor = IntDescriptor;
+    impl Kind for MyData {
+        type FormatDescriptor = DataDescriptor;
         type UsageDescriptor = u32;
     }
 
     #[derive(Debug)]
-    pub struct Int32(pub i32);
+    pub struct Primary(pub i32);
 
-    impl Format for Int32 {
-        type Kind = Int;
+    impl Format for Primary {
+        type Kind = MyData;
 
         fn allocate(descriptor: &<Self::Kind as Kind>::FormatDescriptor) -> Self {
             Self(descriptor.initial_value as i32)
@@ -1491,22 +1598,24 @@ mod tests {
     }
 
     #[derive(Debug)]
-    pub struct DoubledInt32(pub i32);
+    pub struct DerivedAccelerationStructure(pub i32);
 
-    impl Format for DoubledInt32 {
-        type Kind = Int;
+    impl Format for DerivedAccelerationStructure {
+        type Kind = MyData;
 
         fn allocate(descriptor: &<Self::Kind as Kind>::FormatDescriptor) -> Self {
             Self(2 * descriptor.initial_value as i32)
         }
     }
 
-    pub struct DoubleIntDerive;
+    pub struct UpdateAccelerationFromPrimary;
 
-    impl DerivedDescriptor<Int32> for DoubleIntDerive {
-        type Format = DoubledInt32;
+    impl DerivedDescriptor<Primary> for UpdateAccelerationFromPrimary {
+        type Format = DerivedAccelerationStructure;
 
-        fn update(&self, data: &mut Self::Format, parent: &Int32, _: &[&u32]) {
+        fn update(&self, data: &mut Self::Format, parent: &Primary, usage: &[&u32]) {
+            // Do some calculation to update the acceleration structure based upon the
+            // how the primary format has been modified. 
             data.0 = 2 * parent.0;
         }
     }
@@ -1515,14 +1624,14 @@ mod tests {
     #[should_panic]
     fn test_panic_on_conflicting_usage() {
         let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
-        let data = ctx.allocate::<Int32>(AllocationDescriptor {
-            descriptor: IntDescriptor { initial_value: 23 },
+        let data = ctx.allocate::<Primary>(AllocationDescriptor {
+            descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
             derived_formats: &[]
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view = data.view::<Int32>();
+        let view = data.view::<Primary>();
 
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
@@ -1536,15 +1645,15 @@ mod tests {
     #[test]
     fn test_allow_multiple_const_usage() {
         let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
-        let data = ctx.allocate::<Int32>(AllocationDescriptor {
-            descriptor: IntDescriptor { initial_value: 23 },
+        let data = ctx.allocate::<Primary>(AllocationDescriptor {
+            descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
             derived_formats: &[]
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view_a = data.view::<Int32>();
-        let view_b = data.view::<Int32>();
+        let view_a = data.view::<Primary>();
+        let view_b = data.view::<Primary>();
 
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
@@ -1558,14 +1667,14 @@ mod tests {
     #[test]
     fn test_single_mappings() {
         let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
-        let data = ctx.allocate::<Int32>(AllocationDescriptor {
-            descriptor: IntDescriptor { initial_value: 23 },
+        let data = ctx.allocate::<Primary>(AllocationDescriptor {
+            descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
-            derived_formats: &[&Derived::new(DoubleIntDerive)]
+            derived_formats: &[&Derived::new(UpdateAccelerationFromPrimary)]
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view = data.view::<Int32>();
+        let view = data.view::<Primary>();
         
         let view_clone = view.clone();
         command_buffer.schedule(CommandDescriptor {
@@ -1577,7 +1686,7 @@ mod tests {
             views: &[&view.as_mut(4)]
         });
 
-        let mapping1 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
+        let mapping1 = command_buffer.map(&data.view::<DerivedAccelerationStructure>().as_const());
         
         let view_clone = view.clone();
         command_buffer.schedule(CommandDescriptor {
@@ -1589,7 +1698,7 @@ mod tests {
             views: &[&view.as_mut(2)]
         });
 
-        let mapping2 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
+        let mapping2 = command_buffer.map(&data.view::<DerivedAccelerationStructure>().as_const());
         ctx.submit(Some(command_buffer));
 
         let value = ctx.get(&mapping1);
@@ -1606,14 +1715,14 @@ mod tests {
     fn test_skip_irrelevant_command() {
         let execution_count = Arc::new(AtomicU32::new(0));
         let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
-        let data = ctx.allocate::<Int32>(AllocationDescriptor {
-            descriptor: IntDescriptor { initial_value: 23 },
+        let data = ctx.allocate::<Primary>(AllocationDescriptor {
+            descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
-            derived_formats: &[&Derived::new(DoubleIntDerive)]
+            derived_formats: &[&Derived::new(UpdateAccelerationFromPrimary)]
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
-        let view = data.view::<Int32>();
+        let view = data.view::<Primary>();
         
         let ex_clone = execution_count.clone();
         let view_clone = view.clone();
@@ -1636,7 +1745,7 @@ mod tests {
             views: &[&view.as_const()]
         });
 
-        let mapping = command_buffer.map(&data.view::<DoubledInt32>().as_const());
+        let mapping = command_buffer.map(&data.view::<DerivedAccelerationStructure>().as_const());
         ctx.submit(Some(command_buffer));
 
         ctx.get(&mapping);
