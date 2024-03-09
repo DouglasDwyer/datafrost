@@ -107,16 +107,6 @@ impl DynVec {
         }
     }
 
-    /// Gets an immutable reference to an object of type `T` at `offset` bytes into the vector.
-    /// 
-    /// # Safety
-    /// 
-    /// The entirety of the object at the offset must be within the vector's bounds
-    /// and satisfy the alignment of `T`.
-    unsafe fn get<T: 'static>(&self, offset: usize) -> &MaybeUninit<T> {
-        &*self.inner.as_ptr().add(offset).cast()
-    }
-
     /// Gets a mutable reference to an object of type `T` at `offset` bytes into the vector.
     /// 
     /// # Safety

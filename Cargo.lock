@@ -51,6 +51,7 @@ dependencies = [
  "bitvec",
  "mutability_marker",
  "slab",
+ "sync_rw_cell",
  "task_pool",
  "wasm_sync",
 ]
@@ -165,6 +166,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync_rw_cell"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91b5e30d028779dd15ca615b46c3afe9c860d87c6518b288e46fd9bf5bde55b"
+dependencies = [
+ "mutability_marker",
 ]
 
 [[package]]

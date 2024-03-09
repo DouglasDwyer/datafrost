@@ -53,10 +53,6 @@ impl<T> DirectedAcyclicGraph<T> {
         self.nodes.is_empty()
     }
 
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
     pub fn pop(&mut self, node: NodeId) -> T {
         let result = self.nodes.remove(node.0 as usize);
         assert!(result.first_parent_entry == u16::MAX, "Cannot pop node that has dependencies.");
@@ -72,6 +68,7 @@ impl<T> DirectedAcyclicGraph<T> {
         result.value
     }
 
+    #[allow(unused)]
     pub fn nodes(&self) -> impl '_ + Iterator<Item = NodeId> {
         self.nodes.iter().map(|(id, _)| NodeId(id as u16))
     }
@@ -96,13 +93,9 @@ impl<T> DirectedAcyclicGraph<T> {
         let new_entry = self.relatives.insert(NodeListEntry { node: parent, next_entry: node.first_parent_entry });
         node.first_parent_entry = new_entry as u16;
     }
-    
-    pub fn top_level(&self, node: NodeId) -> bool {
-        self.nodes[node.0 as usize].first_parent_entry == u16::MAX
-    }
 
     fn add_child_to_parent(&mut self, parent: NodeId, node: NodeId) {
-        let mut parent_node = &mut self.nodes[parent.0 as usize];
+        let parent_node = &mut self.nodes[parent.0 as usize];
         let new_entry = self.relatives.insert(NodeListEntry { node, next_entry: parent_node.first_child_entry });
         parent_node.first_child_entry = new_entry as u16;
     }
@@ -172,10 +165,6 @@ impl DirectedAcyclicGraphFlags {
         Self {
             flags: BitVec::new()
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.flags.clear();
     }
 
     pub fn resize_for<T>(&mut self, graph: &DirectedAcyclicGraph<T>) {

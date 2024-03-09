@@ -5,21 +5,19 @@
 #![feature(sync_unsafe_cell)]
 #![feature(unsize)]
 
-#![allow(warnings)]
+#![allow(private_interfaces)]
 //#![deny(missing_docs)]
 
 //! Crate docs
 
 use crate::dyn_vec::*;
 use crate::graph::*;
-use crate::rw_cell::*;
 use crate::unique_id::*;
 pub use mutability_marker::*;
 use private::*;
 use slab::*;
 use std::any::*;
 use std::cell::*;
-use std::fmt::Write;
 use std::marker::*;
 use std::mem::*;
 use std::ops::*;
@@ -27,7 +25,9 @@ use std::pin::*;
 use std::sync::*;
 use std::sync::atomic::*;
 use std::sync::mpsc::*;
+use sync_rw_cell::*;
 use task_pool::*;
+#[allow(unused_imports)]
 use wasm_sync::Mutex;
 
 /// Defines a dynamic vector type for efficient allocation of variable-sized, hetegenous objects.
@@ -35,8 +35,6 @@ mod dyn_vec;
 
 /// Implements a directed acyclic graph structure for work scheduling.
 mod graph;
-
-mod rw_cell;
 
 /// Defines a way to create unique IDs.
 mod unique_id;
@@ -110,25 +108,23 @@ impl CommandBuffer {
 
     /// Maps a format for synchronous viewing.
     pub fn map<M: Mutability, F: Format>(&mut self, view: &View<M, F>) -> Mapped<M, F> {
-        unsafe {
-            let inner = Arc::new(MappedInner::default());
+        let inner = Arc::new(MappedInner::default());
     
-            let computation = SyncUnsafeCell::new(Some(Computation::Map { inner: Some(inner.clone()) }));
+        let computation = SyncUnsafeCell::new(Some(Computation::Map { inner: Some(inner.clone()) }));
 
-            let first_view_entry = self.push_views(&[view]);
-            let next_command = self.command_list.push(CommandEntry {
-                computation,
-                first_view_entry,
-                label: Some("Map format"),
-                next_instance: None
-            });
+        let first_view_entry = self.push_views(&[view]);
+        let next_command = self.command_list.push(CommandEntry {
+            computation,
+            first_view_entry,
+            label: Some("Map format"),
+            next_instance: None
+        });
 
-            self.update_first_last_command_entries(next_command);
+        self.update_first_last_command_entries(next_command);
 
-            Mapped {
-                inner,
-                view: view.clone()
-            }
+        Mapped {
+            inner,
+            view: view.clone()
         }
     }
 
@@ -216,7 +212,7 @@ impl CommandContext {
 
     /// Mutably gets the data referenced by the view, and records the usage for updating derived formats.
     /// This function will panic if `view` refers to a derived format.
-    pub fn get_mut<F: Format>(&self, view: &View<Mut, F>, usage: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<Mut, F> {
+    pub fn get_mut<F: Format>(&self, view: &View<Mut, F>, _: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<Mut, F> {
         ViewRef {
             reference: self.find_view(view).borrow_mut(),
             marker: PhantomData
@@ -344,7 +340,7 @@ pub struct DataFrostContext {
 
 impl DataFrostContext {
     /// Allocates a new, empty context.
-    pub fn new(descriptor: ContextDescriptor) -> Self {
+    pub fn new(_: ContextDescriptor) -> Self {
         let (object_update_sender, object_updates) = channel();
 
         let change_notifier = ChangeNotifier::default();
@@ -355,7 +351,6 @@ impl DataFrostContext {
             compute_graph: DirectedAcyclicGraph::new(),
             critical_nodes: DirectedAcyclicGraphFlags::new(),
             critical_top_level_nodes: DirectedAcyclicGraphFlags::new(),
-            label: descriptor.label,
             objects: Slab::new(),
             object_update_sender,
             object_updates,
@@ -406,7 +401,7 @@ impl DataFrostContext {
     /// Mutably gets the data referenced by the mapping, and records the usage for updating derived formats.
     /// This function will block if the mapping is not yet available.
     /// This function will panic if `view` refers to a derived format.
-    pub fn get_mut<'a, F: Format>(&self, mapping: &'a mut Mapped<Mut, F>, usage: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<'a, Mut, F> {
+    pub fn get_mut<'a, F: Format>(&self, _: &'a mut Mapped<Mut, F>, _: <F::Kind as Kind>::UsageDescriptor) -> ViewRef<'a, Mut, F> {
         todo!()
     }
 
@@ -531,20 +526,25 @@ impl<M: Mutability, F: Format> ViewUsageInner for View<M, F> {
     }
 }
 
+pub struct ViewDescriptor<'a, M: UsageMutability, F: Format> {
+    view: &'a View<M, F>,
+    descriptor: M::Descriptor<F>
+}
+
 /// A guard which allows access to the data of a format.
-pub struct ViewRef<'a, M: RwCellMutability, F: Format> {
+pub struct ViewRef<'a, M: Mutability, F: Format> {
     /// The inner reference to the data.
-    reference: <M as RwCellMutability>::Ref<'a, *mut ()>,
+    reference: RwCellGuard<'a, M, *mut ()>,
     marker: PhantomData<(&'a F, fn() -> M)>
 }
 
-impl<'a, M: RwCellMutability, F: Format + std::fmt::Debug> std::fmt::Debug for ViewRef<'a, M, F> {
+impl<'a, M: Mutability, F: Format + std::fmt::Debug> std::fmt::Debug for ViewRef<'a, M, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         (**self).fmt(f)
     }
 }
 
-impl<'a, M: RwCellMutability, F: Format> Deref for ViewRef<'a, M, F> {
+impl<'a, M: Mutability, F: Format> Deref for ViewRef<'a, M, F> {
     type Target = F;
 
     fn deref(&self) -> &Self::Target {
@@ -565,6 +565,7 @@ impl<'a, F: Format> DerefMut for ViewRef<'a, Mut, F> {
 trait DerivedFormatUpdater: 'static + Send + Sync {
     unsafe fn allocate(&self, descriptor: *const ()) -> Box<UnsafeCell<dyn Any + Send + Sync>>;
     fn format_type_id(&self) -> TypeId;
+    unsafe fn update(&self, context: CommandContext);
 }
 
 trait ExecutableCommand: 'static + Send + Sync {
@@ -573,7 +574,6 @@ trait ExecutableCommand: 'static + Send + Sync {
 
 trait ViewHolder: 'static + Send + Sync {
     fn context_id(&self) -> u64;
-    fn format_type_id(&self) -> TypeId;
     fn id(&self) -> u32;
     fn mutable(&self) -> bool;
 }
@@ -587,10 +587,6 @@ impl<F: 'static + Send + Sync + FnOnce(CommandContext)> ExecutableCommand for Sy
 impl<M: Mutability, F: Format> ViewHolder for View<M, F> {
     fn context_id(&self) -> u64 {
         self.inner.inner.context_id
-    }
-
-    fn format_type_id(&self) -> TypeId {
-        TypeId::of::<F>()
     }
 
     fn id(&self) -> u32 {
@@ -660,7 +656,6 @@ struct ContextInner {
     context_id: u64,
     critical_nodes: DirectedAcyclicGraphFlags,
     critical_top_level_nodes: DirectedAcyclicGraphFlags,
-    label: Option<&'static str>,
     objects: Slab<DataHolder>,
     object_update_sender: Sender<ObjectUpdate>,
     object_updates: std::sync::mpsc::Receiver<ObjectUpdate>,
@@ -780,7 +775,31 @@ impl ContextInner {
                         value.mapped.store(true, Ordering::Release);
                         Some(None)
                     },
-                    Computation::Update { object } => todo!(),
+                    Computation::Update { object } => {
+                        let derived = *object;
+                        let value = &self.objects[derived as usize];
+                        let FormatDeriveState::Derived { updater, parent, index, .. } = &value.derive_state 
+                        else {
+                            unreachable!()
+                        };
+
+                        let parent = *parent as usize;
+                        let index = *index as usize;
+                        let updater = updater.clone();
+
+                        let format_state = if let FormatDeriveState::Base { derived_formats } = &mut self.objects[parent].derive_state {
+                            &mut derived_formats[index]
+                        }
+                        else {
+                            unreachable!()
+                        };
+
+                        if format_state.next_update == Some(node) {
+                            format_state.next_update = None;
+                        }
+
+                        Some(Some(Box::new(move || updater.update(ctx))))
+                    },
                 }
             }
             else {
@@ -930,7 +949,6 @@ impl ContextInner {
                                     command_buffer: command_buffer_id as u16,
                                     derived_update: Some(DerivedFormatUpdate {
                                         parent: view_id,
-                                        id: format.id,
                                         index: index as u32
                                     }),
                                     desc: "update",
@@ -950,7 +968,7 @@ impl ContextInner {
                             }
                         }
                     },
-                    &mut FormatDeriveState::Derived { parent: parent, index: index, .. } => {
+                    &mut FormatDeriveState::Derived { parent, index, .. } => {
                         if let FormatDeriveState::Base { derived_formats } = &mut self.objects[parent as usize].derive_state {
                             derived_formats[index as usize].next_update = None;
                         }
@@ -992,6 +1010,7 @@ impl ContextInner {
         }
     }
 
+    #[allow(unused)]
     fn print_graph(&self) {
         for node in self.compute_graph.nodes() {
             println!("{node:?} {} => {:?}", self.compute_graph[node].desc, self.compute_graph.children(node).collect::<Vec<_>>());
@@ -1064,7 +1083,6 @@ impl<K: Kind> Drop for DataInner<K> {
 
 struct DerivedFormatUpdate {
     pub parent: u32,
-    pub id: u32,
     pub index: u32
 }
 
@@ -1149,26 +1167,30 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
     fn format_type_id(&self) -> TypeId {
         TypeId::of::<D::Format>()
     }
+
+    unsafe fn update(&self, context: CommandContext) {
+        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[1].value.borrow().cast(), &[]);
+    }
 }
 
 /// Hides implementation details from other crates.
 mod private {
     use super::*;
 
-    pub trait RwCellMutability: Mutability {
-        type Ref<'a, T: 'a + ?Sized>: Deref<Target = T>;
-    }
-    
-    impl RwCellMutability for Const {
-        type Ref<'a, T: 'a + ?Sized> = RwCellGuard<'a, T>;
-    }
-    
-    impl RwCellMutability for Mut {
-        type Ref<'a, T: 'a + ?Sized> = RwCellGuardMut<'a, T>;
-    }
-
     pub trait ViewUsageInner {
         fn add_to_list(&self, command_list: &mut DynVec) -> DynEntry<dyn ViewHolder>;
+    }
+
+    pub trait UsageMutability: Mutability {
+        type Descriptor<F: Format>;
+    }
+
+    impl UsageMutability for Const {
+        type Descriptor<F: Format> = ();
+    }
+
+    impl UsageMutability for Mut {
+        type Descriptor<F: Format> = <F::Kind as Kind>::UsageDescriptor;
     }
 }
 
@@ -1199,6 +1221,13 @@ mod tests {
         }
     }
 
+    impl Drop for Int32 {
+        fn drop(&mut self) {
+            println!("Drop int");
+        }
+    }
+
+    #[derive(Debug)]
     pub struct DoubledInt32(pub i32);
 
     impl Format for DoubledInt32 {
@@ -1209,12 +1238,19 @@ mod tests {
         }
     }
 
+    impl Drop for DoubledInt32 {
+        fn drop(&mut self) {
+            println!("Drop doubled");
+        }
+    }
+
     pub struct DoubleIntDerive;
 
     impl DerivedDescriptor<Int32> for DoubleIntDerive {
         type Format = DoubledInt32;
 
         fn update(&self, data: &mut Self::Format, parent: &Int32, usages: &[&u32]) {
+            println!("UPDATE DESC {data:?} {parent:?}");
             for &&x in usages {
                 data.0 += 2 * x as i32;
             }
@@ -1272,37 +1308,48 @@ mod tests {
         let data = ctx.allocate::<Int32>(AllocationDescriptor {
             descriptor: IntDescriptor { initial_value: 23 },
             label: Some("my int"),
-            derived_formats: &[]
+            derived_formats: &[&Derived::new(DoubleIntDerive)]
         });
         
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
         let view = data.view::<Mut, Int32>();
         
-        let view2 = data.view::<Const, Int32>();
         let view_clone = view.clone();
         command_buffer.schedule(CommandDescriptor {
             label: Some("Test command"),
             command: move |ctx| {
-                println!("Execute");
-                ctx.get_mut(&view_clone, 4).0 += 4;
+                let mut vc = ctx.get_mut(&view_clone, 4);
+                println!("Execute {vc:?}");
+                vc.0 += 4;
             },
             views: &[&view]
         });
 
-        let view = data.view::<Const, Int32>();
-        let view_clone = view.clone();
-        command_buffer.schedule(CommandDescriptor {
-            label: Some("Test command"),
-            command: move |ctx| {
-                println!("Execute const {:?}", ctx.get(&view_clone));
-            },
-            views: &[&view]
-        });
+        let mapping1 = command_buffer.map(&data.view::<Const, DoubledInt32>());
+        
+        if true {
+            let view_clone = view.clone();
+            command_buffer.schedule(CommandDescriptor {
+                label: Some("Test command"),
+                command: move |ctx| {
+                    let mut vc = ctx.get_mut(&view_clone, 2);
+                    println!("Execute2 {vc:?}");
+                    vc.0 += 2;
+                },
+                views: &[&view]
+            });
+        }
 
-        let mapping = command_buffer.map(&data.view::<Mut, Int32>());
+        let mapping2 = command_buffer.map(&data.view::<Const, DoubledInt32>());
         ctx.submit(Some(command_buffer));
 
-        let value = ctx.get(&mapping);
+        let value = ctx.get(&mapping1);
         println!("Mapped {}", value.0);
+        drop(value);
+        drop(mapping1);
+        let value = ctx.get(&mapping2);
+        println!("Mapped {}", value.0);
+        drop(value);
+        drop(mapping2);
     }
 }
