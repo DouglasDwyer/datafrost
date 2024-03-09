@@ -1,3 +1,4 @@
+#![feature(alloc_layout_extra)]
 #![feature(coerce_unsized)]
 #![feature(downcast_unchecked)]
 #![feature(non_null_convenience)]
@@ -6,7 +7,8 @@
 #![feature(unsize)]
 
 #![allow(private_interfaces)]
-//#![deny(missing_docs)]
+#![deny(missing_docs)]
+#![deny(clippy::missing_docs_in_private_items)]
 
 //! Crate docs
 
@@ -28,7 +30,7 @@ use std::sync::mpsc::*;
 use sync_rw_cell::*;
 use task_pool::*;
 #[allow(unused_imports)]
-use wasm_sync::Mutex;
+use wasm_sync::{Condvar, Mutex};
 
 /// Defines a dynamic vector type for efficient allocation of variable-sized, hetegenous objects.
 mod dyn_vec;
@@ -108,7 +110,11 @@ impl CommandBuffer {
 
     /// Maps a format for synchronous viewing.
     pub fn map<M: UsageMutability, F: Format>(&mut self, view: &ViewDescriptor<M, F>) -> Mapped<M, F> {
-        let inner = Arc::new(MappedInner::default());
+        let inner = Arc::new(MappedInner {
+            context_id: view.view.inner.inner.context_id,
+            command_context: UnsafeCell::new(MaybeUninit::uninit()),
+            mapped: AtomicBool::new(false)
+        });
     
         let computation = SyncUnsafeCell::new(Some(Computation::Map { inner: Some(inner.clone()) }));
 
@@ -195,10 +201,15 @@ pub struct CommandBufferDescriptor {
 /// Allows for interacting with format data during command execution.
 /// When this object is dropped, a command is considered complete.
 pub struct CommandContext {
+    /// The ID of the command that is currently executing.
     command_id: NodeId,
+    /// A reference to the context.
     context: Arc<ContextHolder>,
+    /// An optional label describing the command.
     label: Option<&'static str>,
+    /// An optional label describing the command buffer.
     command_buffer_label: Option<&'static str>,
+    /// The list of views that this context references.
     views: Vec<CommandContextView>
 }
 
@@ -220,6 +231,7 @@ impl CommandContext {
         }
     }
 
+    /// Gets the proper reference to the view, or panics if the view was invalid.
     fn find_view<M: Mutability, F: Format>(&self, view: &View<F>) -> &RwCell<*mut ()> {
         let mutable = TypeId::of::<Mut>() == TypeId::of::<M>();
         if let Some(command_view) = self.views.iter().find(|x| x.id == view.id && x.mutable == mutable) {
@@ -383,7 +395,7 @@ impl DataFrostContext {
     /// Immutably gets the data referenced by the mapping. This function will block if the mapping is not yet available.
     pub fn get<'a, M: Mutability, F: Format>(&self, mapping: &'a Mapped<M, F>) -> ViewRef<'a, Const, F> {
         unsafe {
-            assert!(mapping.inner.context_id.load(Ordering::Acquire) == self.holder.context_id, "Mapping was not from this context.");
+            assert!(mapping.inner.context_id == self.holder.context_id, "Mapping was not from this context.");
 
             if !mapping.inner.mapped.load(Ordering::Acquire) {
                 let mut inner = self.inner();
@@ -407,7 +419,7 @@ impl DataFrostContext {
     /// Mutably gets the data referenced by the mapping. This function will block if the mapping is not yet available.
     pub fn get_mut<'a, F: Format>(&self, mapping: &'a mut Mapped<Mut, F>) -> ViewRef<'a, Mut, F> {
         unsafe {
-            assert!(mapping.inner.context_id.load(Ordering::Acquire) == self.holder.context_id, "Mapping was not from this context.");
+            assert!(mapping.inner.context_id == self.holder.context_id, "Mapping was not from this context.");
 
             if !mapping.inner.mapped.load(Ordering::Acquire) {
                 let mut inner = self.inner();
@@ -499,9 +511,14 @@ impl<F: Format> std::fmt::Debug for Derived<F> {
     }
 }
 
+/// A handle created by calling [`CommandBuffer::map`] which allows
+/// for synchronously accessing the data of a [`View`].
 pub struct Mapped<M: Mutability, F: Format> {
+    /// The inner state used to track the mapping.
     inner: Arc<MappedInner>,
+    /// The view associating with this mapping.
     view: View<F>,
+    /// Marker data.
     marker: PhantomData<fn() -> M>
 }
 
@@ -518,6 +535,7 @@ pub struct View<F: Format> {
 }
 
 impl<F: Format> View<F> {
+    /// Marks this view as being used immutably from a command.
     pub fn as_const(&self) -> ViewDescriptor<Const, F> {
         ViewDescriptor {
             view: self,
@@ -526,6 +544,7 @@ impl<F: Format> View<F> {
         }
     }
 
+    /// Marks this view as being used mutably from a command, with the given usage.
     pub fn as_mut(&self, usage: <F::Kind as Kind>::UsageDescriptor) -> ViewDescriptor<Mut, F> {
         ViewDescriptor {
             view: self,
@@ -560,9 +579,14 @@ impl<F: Format> std::fmt::Debug for View<F> where <F::Kind as Kind>::FormatDescr
     }
 }
 
+/// Declares how a command will use a view. Created by calling [`View::as_const`]
+/// or [`View::as_mut`].
 pub struct ViewDescriptor<'a, M: UsageMutability, F: Format> {
+    /// The underlying view.
     view: &'a View<F>,
+    /// The usage for the view.
     descriptor: SyncUnsafeCell<Option<M::Descriptor<F>>>,
+    /// Whether the usage has been moved into the command buffer yet.
     taken: AtomicBool
 }
 
@@ -584,7 +608,8 @@ impl<'a, M: UsageMutability, F: Format> ViewUsageInner for ViewDescriptor<'a, M,
 pub struct ViewRef<'a, M: Mutability, F: Format> {
     /// The inner reference to the data.
     reference: RwCellGuard<'a, M, *mut ()>,
-    marker: PhantomData<(&'a F, fn() -> M)>
+    /// Marker data.
+    marker: PhantomData<&'a F>
 }
 
 impl<'a, M: Mutability, F: Format + std::fmt::Debug> std::fmt::Debug for ViewRef<'a, M, F> {
@@ -611,20 +636,47 @@ impl<'a, F: Format> DerefMut for ViewRef<'a, Mut, F> {
     }
 }
 
+/// Implements the ability to create and update a derived resource.
 trait DerivedFormatUpdater: 'static + Send + Sync {
+    /// Allocates an instance of the derived format.
     unsafe fn allocate(&self, descriptor: *const ()) -> Box<UnsafeCell<dyn Any + Send + Sync>>;
+
+    /// The type ID of the derived format.
     fn format_type_id(&self) -> TypeId;
+    
+    /// Updates the derived format for the given usages.
+    /// 
+    /// # Safety
+    /// 
+    /// This function must be called with a context that contains an immutable
+    /// view (the parent) and a mutable view (the derived) object.
+    /// The set of usages must match the usage descriptor type shared
+    /// by both the parent and child.
     unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]);
 }
 
+/// A user-specified command that may be executed.
 trait ExecutableCommand: 'static + Send + Sync {
+    /// Executes this command.
+    /// 
+    /// # Safety
+    /// 
+    /// This function must only be called once.
     unsafe fn execute(&self, ctx: CommandContext);
 }
 
+/// Determines how a command will view an object.
 trait ViewHolder: 'static + Send + Sync {
+    /// The ID of the context associated with this view.
     fn context_id(&self) -> u64;
+
+    /// The ID of the object refernced by this view.
     fn id(&self) -> u32;
+    
+    /// Whether this is a mutable view.
     fn mutable(&self) -> bool;
+
+    /// Gets a pointer to the usage of this view, if any.
     fn usage(&self) -> *const ();
 }
 
@@ -634,60 +686,98 @@ impl<F: 'static + Send + Sync + FnOnce(CommandContext)> ExecutableCommand for Sy
     }
 }
 
+/// Holds a command buffer which describes work to perform on objects.
 struct ActiveCommandBuffer {
+    /// A reference to the list of commands used by this buffer.
     command_list: Arc<DynVec>,
+    /// An optional label for the command buffer.
     label: Option<&'static str>,
+    /// The set of commands that are left before this command buffer may be discarded.
     remaining_commands: u32
 }
 
+/// Stores information about a view accessible from a command context.
 struct CommandContextView {
+    /// The ID of the view.
     pub id: u32,
+    /// Whether the view is mutable.
     pub mutable: bool,
+    /// A cell containing a pointer to the view.
     pub value: RwCell<*mut ()>
 }
 
+/// Describes a single command within a command list.
 struct CommandEntry {
+    /// The computation to complete.
     pub computation: SyncUnsafeCell<Option<Computation>>,
+    /// The first view entry in the views linked list.
     pub first_view_entry: Option<DynEntry<ViewEntry>>,
+    /// The label of this command.
     pub label: Option<&'static str>,
+    /// The next command entry in the command list.
     pub next_instance: Option<DynEntry<CommandEntry>>,
 }
 
+/// Describes an operation which corresponds to a node
+/// in the computation graph.
 #[derive(Clone)]
 enum Computation {
+    /// A command must be executed against object data.
     Execute {
+        /// The command to execute.
         command: DynEntry<dyn ExecutableCommand>
     },
+    /// An object should be mapped and made available synchronously.
     Map {
+        /// The inner context to map.
         inner: Option<Arc<MappedInner>>
     },
+    /// A derived object's data must be updated.
     Update {
+        /// The object to update.
         object: u32,
+        /// The list of updates that this object should reference.
         updates: Vec<(Arc<DynVec>, DynEntry<dyn ViewHolder>)>
     }
 }
 
+/// Describes an operation within the computation graph.
 struct ComputationNode {
+    /// The computation to complete.
     pub computation: Computation,
+    /// The command buffer containing the computation.
     pub command_buffer: u16,
+    /// Information about the update which will take place, if
+    /// this node is updating derived data.
     pub derived_update: Option<DerivedFormatUpdate>,
+    /// A label describing this computation.
     pub label: Option<&'static str>,
+    /// The set of views used by this computation.
     pub views: Vec<ComputationViewReference>
 }
 
+/// Describes a view used by a computation.
 struct ComputationViewReference {
+    /// The ID of the view object.
     pub id: u32,
+    /// Whether this is a mutable view.
     pub mutable: bool,
+    /// The holder used to access the view.
     pub view_holder: DynEntry<dyn ViewHolder>
 }
 
+/// Wakes all threads from a [`Condvar`] upon being signalled by
+/// a [`ChangeNotifier`].
 struct CondvarNotificationListener {
+    /// A handle to the listener from the change notifier.
     #[allow(unused)]
     handle: ChangeNotificationListener,
+    /// The conditional upon which to wait.
     inner: Arc<Condvar>,
 }
 
 impl CondvarNotificationListener {
+    /// Creates a new notification listener and attaches it to the provided [`ChangeNotifier`].
     pub fn new(notifier: &ChangeNotifier) -> Self {
         let inner = Arc::new(Condvar::new());
         let inner_clone = inner.clone();
@@ -699,29 +789,48 @@ impl CondvarNotificationListener {
         }
     }
 
+    /// Waits for a signal from the change notifier.
     pub unsafe fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         self.inner.wait(guard).unwrap_unchecked()
     }
 }
 
+/// Holds the inner data for a context.
 struct ContextHolder {
+    /// The notifier to use when new work is available from the context.
     change_notifier: ChangeNotifier,
+    /// The listener to use when waiting for changes from the context.
     change_listener: CondvarNotificationListener,
+    /// The ID of the context.
     context_id: u64,
+    /// The inner mutable context data.
     inner: Mutex<ContextInner>
 }
 
+/// Manages a set of objects and efficiently schedules
+/// computations on them.
 struct ContextInner {
+    /// The list of command buffers that are referenced by commands.
     active_command_buffers: Slab<ActiveCommandBuffer>,
+    /// The compute graph containing operation nodes.
     compute_graph: DirectedAcyclicGraph<ComputationNode>,
+    /// The ID of the context.
     context_id: u64,
+    /// The set of nodes that must complete for mappings to be available.
     critical_nodes: DirectedAcyclicGraphFlags,
+    /// The set of nodes that are both critical and immediately schedulable.
     critical_top_level_nodes: DirectedAcyclicGraphFlags,
+    /// The set of objects within the context.
     objects: Slab<DataHolder>,
+    /// A sender used to alert the context of object updates.
     object_update_sender: Sender<ObjectUpdate>,
+    /// Receives updates about the objects within the context.
     object_updates: std::sync::mpsc::Receiver<ObjectUpdate>,
+    /// Whether an update should be sent out on the notifier when new work is available.
     stalled: bool,
+    /// A buffer used to temporarily store node IDs without reallocation.
     temporary_node_buffer: Vec<NodeId>,
+    /// The set of nodes the are immediately schedulable.
     top_level_nodes: DirectedAcyclicGraphFlags,
 }
 
@@ -803,6 +912,7 @@ impl ContextInner {
         }
     }
 
+    /// Creates a command context to execute the provided computation.
     fn create_command_context(&self, context: &Arc<ContextHolder>, command_id: NodeId) -> CommandContext {
         let computation = &self.compute_graph[command_id];
         CommandContext {
@@ -818,6 +928,8 @@ impl ContextInner {
         }
     }
 
+    /// Attempts to get the next command to execute. Returns `None` if no work is presently available,
+    /// `Some(None)` if new mappings were made available, and `Some(Some(_))` if work must be done.
     fn prepare_next_command(&mut self, context: &Arc<ContextHolder>) -> Option<Option<Box<dyn WorkUnit>>> {
         unsafe {
             if let Some(node) = self.pop_command() {
@@ -863,7 +975,7 @@ impl ContextInner {
                         Some(Some(Box::new(move || {
                             let mut update_list = Vec::with_capacity(updates.len());
                             update_list.extend(updates.iter().map(|(buffer, entry)| buffer[*entry].usage()));
-                            updater.update(ctx, transmute(&update_list[..]));
+                            updater.update(ctx, &update_list[..] as *const _);
                         })))
                     },
                 }
@@ -878,6 +990,8 @@ impl ContextInner {
         }
     }
 
+    /// Determines the next command to schedule, removes it from the graph,
+    /// and returns it. Prioritizes critical nodes.
     fn pop_command(&mut self) -> Option<NodeId> {
         if let Some(node) = self.critical_top_level_nodes.first_set_node() {
             self.critical_top_level_nodes.set(node, false);
@@ -893,6 +1007,7 @@ impl ContextInner {
         }
     }
 
+    /// Schedules all commands in the provided buffer for processing.
     fn submit_buffer(&mut self, buffer: CommandBuffer) -> bool {
         unsafe {
             let mut added_top_level_node = false;
@@ -916,6 +1031,7 @@ impl ContextInner {
         }
     }
 
+    /// Schedules a command to execute.
     fn schedule_command(&mut self, command_buffer_id: u16, command_buffer_label: Option<&'static str>, computation: Computation, label: Option<&'static str>, first_view_entry: Option<DynEntry<ViewEntry>>) -> bool {
         unsafe {
             let command_buffer = self.active_command_buffers[command_buffer_id as usize].command_list.clone();
@@ -987,7 +1103,7 @@ impl ContextInner {
             // Add the new computation to the graph
             self.compute_graph.insert(ComputationNode {
                 computation: computation.clone(),
-                command_buffer: command_buffer_id as u16,
+                command_buffer: command_buffer_id,
                 derived_update: None,
                 label,
                 views
@@ -996,6 +1112,7 @@ impl ContextInner {
             self.top_level_nodes.resize_for(&self.compute_graph);
             self.critical_nodes.resize_for(&self.compute_graph);
 
+            // Update any derived views that this command affects
             for i in 0..self.compute_graph[node].views.len() {
                 let view = &self.compute_graph[node].views[i];
                 let view_id = view.id;
@@ -1014,7 +1131,7 @@ impl ContextInner {
                             else {
                                 let derived_computation = self.compute_graph.insert(ComputationNode {
                                     computation: Computation::Update { object: format.id, updates: Vec::with_capacity(1) },
-                                    command_buffer: command_buffer_id as u16,
+                                    command_buffer: command_buffer_id,
                                     derived_update: Some(DerivedFormatUpdate {
                                         parent: view_id,
                                         index: index as u32
@@ -1022,11 +1139,11 @@ impl ContextInner {
                                     label: None,
                                     views: vec!(ComputationViewReference {
                                         id: view_id,
-                                        view_holder: view_holder,
+                                        view_holder,
                                         mutable: false
                                     }, ComputationViewReference {
                                         id: format.id,
-                                        view_holder: view_holder,
+                                        view_holder,
                                         mutable: true
                                     })
                                 }, &[node]);
@@ -1061,7 +1178,7 @@ impl ContextInner {
             }
 
             if let Computation::Map { inner } = computation {
-                inner.unwrap_unchecked().context_id.store(self.context_id, Ordering::Release);
+                assert!(inner.as_ref().unwrap_unchecked().context_id == self.context_id, "Attempted to map object in incorrect context.");
                 self.mark_critical(node);
             }
 
@@ -1077,6 +1194,7 @@ impl ContextInner {
         }
     }
 
+    /// Marks the provided node, and all of its parents, as critical.
     fn mark_critical(&mut self, node: NodeId) {
         self.critical_nodes.set(node, true);
         while let Some(parent) = self.temporary_node_buffer.pop() {
@@ -1087,6 +1205,7 @@ impl ContextInner {
         }
     }
 
+    /// Marks a command as complete and removes it from the node graph.
     fn complete_command(&mut self, id: NodeId, context: &ContextHolder) {
         self.temporary_node_buffer.clear();
         self.temporary_node_buffer.extend(self.compute_graph.children(id));
@@ -1112,36 +1231,66 @@ impl ContextInner {
 
         self.critical_top_level_nodes.and(&self.top_level_nodes, &self.critical_nodes);
 
+        let command_list = &mut self.active_command_buffers[computation.command_buffer as usize];
+        command_list.remaining_commands -= 1;
+        if command_list.remaining_commands == 0 {
+            self.active_command_buffers.remove(computation.command_buffer as usize);
+        }
+
         if !self.temporary_node_buffer.is_empty() && self.stalled {
             self.stalled = false;
             context.change_notifier.notify();
         }
     }
 
+    /// Updates the objects of this context, discarding any which have been dropped.
     fn update_objects(&mut self) {
         while let Ok(update) = self.object_updates.try_recv() {
             match update {
-                ObjectUpdate::DropData { id } => { self.objects.remove(id as usize); },
+                ObjectUpdate::DropData { id } => {
+                    let FormatDeriveState::Base { derived_formats } = self.objects.remove(id as usize).derive_state
+                    else {
+                        unreachable!()
+                    };
+
+                    for format in derived_formats {
+                        self.objects.remove(format.id as usize);
+                    }
+                },
             }
         }
     }
 }
 
+/// Holds an object within a context.
 struct DataHolder {
+    /// Information about the base or derived state of this object.
     pub derive_state: FormatDeriveState,
+    /// An optional label describing this object.
     pub label: Option<&'static str>,
+    /// A list of computations which use this object immutably.
     pub immutable_references: Vec<NodeId>,
+    /// A list of computations which use this object mutably.
     pub mutable_references: Vec<NodeId>,
+    /// A refernce to the inner object.
     pub value: Pin<Box<UnsafeCell<dyn Any + Send + Sync>>>,
 }
 
+/// Holds the inner information for an allocated object.
 struct DataInner<K: Kind> {
+    /// The ID of the context associated with this data.
     pub context_id: u64,
+    /// A list of any derived formats for this data.
     pub derived_formats: Vec<(TypeId, u32)>,
+    /// The descriptor of this data.
     pub descriptor: K::FormatDescriptor,
+    /// The ID of the format associated with this data.
     pub format_id: TypeId,
+    /// The ID of this object.
     pub id: u32,
+    /// An optional label describing this object.
     pub label: Option<&'static str>,
+    /// The updater to notify when this data is dropped.
     pub object_updater: Sender<ObjectUpdate>
 }
 
@@ -1151,28 +1300,45 @@ impl<K: Kind> Drop for DataInner<K> {
     }
 }
 
+/// Provides information about how a format update should take place.
 struct DerivedFormatUpdate {
+    /// The parent of this format.
     pub parent: u32,
+    /// The index of this format within the parent's derived list.
     pub index: u32
 }
 
+/// Stores information about the state of a base's derived format.
 struct DerivedFormatState {
+    /// The type ID of this format.
     pub format_id: TypeId,
+    /// The ID of this format.
     pub id: u32,
+    /// The next update that is scheduled for this derived format.
     pub next_update: Option<NodeId>
 }
 
+/// Describes whether an object is a base object
+/// or derived data.
 enum FormatDeriveState {
+    /// The object is a mutable base object.
     Base {
+        /// The set of objects derived from this one.
         derived_formats: Vec<DerivedFormatState>,
     },
+    /// The object derives its data from another.
     Derived {
+        /// The ID of the parent object.
         parent: u32,
+        /// The index of the object in the parent's derived array.
         index: u8,
+        /// The object to use when updating this format.
         updater: Arc<dyn DerivedFormatUpdater>
     }
 }
 
+/// Prints a formatted object label with a prefix and suffix,
+/// or prints nothing if the object did not exist.
 struct FormattedLabel(pub &'static str, pub Option<&'static str>, pub &'static str);
 
 impl std::fmt::Display for FormattedLabel {
@@ -1186,20 +1352,14 @@ impl std::fmt::Display for FormattedLabel {
     }
 }
 
+/// The state associated with mapped data.
 struct MappedInner {
-    pub context_id: AtomicU64,
+    /// The ID of the context associated with the mapping.
+    pub context_id: u64,
+    /// The command context associated with the mapping.
     pub command_context: UnsafeCell<MaybeUninit<CommandContext>>,
+    /// Whether this object has been mapped yet.
     pub mapped: AtomicBool
-}
-
-impl Default for MappedInner {
-    fn default() -> Self {
-        Self {
-            context_id: AtomicU64::new(u64::MAX),
-            command_context: UnsafeCell::new(MaybeUninit::uninit()),
-            mapped: AtomicBool::new(false)
-        }
-    }
 }
 
 impl Drop for MappedInner {
@@ -1213,19 +1373,28 @@ impl Drop for MappedInner {
 unsafe impl Send for MappedInner {}
 unsafe impl Sync for MappedInner {}
 
+/// Notifies the context of an update that has occurred to an object.
 enum ObjectUpdate {
+    /// An object has been dropped.
     DropData {
+        /// The ID of the object which has been dropped.
         id: u32
     }
 }
 
+/// A node in a linked list of views used by a command.
 struct ViewEntry {
+    /// The next view in the linked list, if any.
     pub next_instance: Option<DynEntry<ViewEntry>>,
+    /// The view itself.
     pub view: DynEntry<dyn ViewHolder>
 }
 
+/// Implements the ability to update a derived format.
 struct TypedDerivedFormatUpdater<F: Format, D: DerivedDescriptor<F>> {
+    /// The descriptor determining how to update the format.
     pub descriptor: D,
+    /// Marker data.
     pub marker: PhantomData<fn() -> (F, D)>
 }
 
@@ -1239,12 +1408,15 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
     }
 
     unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]) {
-        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[0].value.borrow().cast_const().cast(), transmute(usages));
+        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[0].value.borrow().cast_const().cast(), &*transmute::<_, *const [_]>(usages));
     }
 }
 
+/// Acts as a view holder for the provided view and descriptor.
 struct TypedViewHolder<M: UsageMutability, F: Format> {
+    /// The view that this holder references.
     view: View<F>,
+    /// The descriptor determining how this view is being used.
     descriptor: M::Descriptor<F>,
 }
 
@@ -1270,11 +1442,15 @@ impl<M: UsageMutability, F: Format> ViewHolder for TypedViewHolder<M, F> {
 mod private {
     use super::*;
 
+    /// Provides the ability to add a view to a command buffer.
     pub trait ViewUsageInner {
+        /// Adds a view holder entry to the given command list.
         fn add_to_list(&self, command_list: &mut DynVec) -> DynEntry<dyn ViewHolder>;
     }
 
+    /// Mutability which optionally stores a descriptor about a view's usage.
     pub trait UsageMutability: Mutability {
+        /// The descriptor that must be provided for this mutability.
         type Descriptor<F: Format>: Send + Sync;
     }
 
