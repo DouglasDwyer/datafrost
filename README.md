@@ -10,11 +10,11 @@
 
 - Create primary data objects, and define "derived" datatypes whose contents are generated from the primary format.
 - Track how a primary object changes and automatically update the affected parts of the derived formats.
+- Map the contents of data objects and read them on the main thread.
 - Schedule commands to asynchronously and concurrently read or modify data objects.
   - `datafrost` guarantees optimal scheduling by building a directed acyclic graph to represent pending operations.
   - Multiple commands which reference different data, or immutably reference the same data, will execute in parallel.
-  - Commands which mutably access the same data run in sequence, without the possibility of data races. 
-- Map the contents of data objects and read their results on the main thread.
+  - Commands which mutably access the same data run in sequence, without the possibility of data races.
 
 ## Usage
 
