@@ -738,7 +738,7 @@ impl ContextInner {
                 immutable_references: Vec::new(),
                 mutable_references: Vec::new(),
                 label: descriptor.label,
-                derive_state: FormatDeriveState::Base { derived_formats: Vec::new() },
+                derive_state: FormatDeriveState::Base { derived_formats: Vec::with_capacity(descriptor.derived_formats.len()) },
                 value: Box::pin(UnsafeCell::new(object))
             }) as u32;
 
@@ -1034,7 +1034,6 @@ impl ContextInner {
                                 object.immutable_references.push(derived_computation);
                                 derived_nodes_to_add.push((format.id, derived_computation));
                                 self.active_command_buffers[command_buffer_id as usize].remaining_commands += 1;
-                                println!("ADD {derived_computation:?}");
                                 derived_computation
                             };
 
@@ -1240,7 +1239,7 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
     }
 
     unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]) {
-        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[1].value.borrow().cast(), transmute(usages));
+        self.descriptor.update(&mut *context.views[1].value.borrow().cast(), &*context.views[0].value.borrow().cast_const().cast(), transmute(usages));
     }
 }
 
@@ -1315,12 +1314,6 @@ mod tests {
         }
     }
 
-    impl Drop for Int32 {
-        fn drop(&mut self) {
-            println!("Drop int");
-        }
-    }
-
     #[derive(Debug)]
     pub struct DoubledInt32(pub i32);
 
@@ -1332,20 +1325,13 @@ mod tests {
         }
     }
 
-    impl Drop for DoubledInt32 {
-        fn drop(&mut self) {
-            println!("Drop doubled");
-        }
-    }
-
     pub struct DoubleIntDerive;
 
     impl DerivedDescriptor<Int32> for DoubleIntDerive {
         type Format = DoubledInt32;
 
-        fn update(&self, data: &mut Self::Format, parent: &Int32, usages: &[&u32]) {
+        fn update(&self, data: &mut Self::Format, parent: &Int32, _: &[&u32]) {
             data.0 = 2 * parent.0;
-            println!("{usages:?}");
         }
     }
 
@@ -1394,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_api() {
+    fn test_single_mappings() {
         let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
         let data = ctx.allocate::<Int32>(AllocationDescriptor {
             descriptor: IntDescriptor { initial_value: 23 },
@@ -1410,37 +1396,74 @@ mod tests {
             label: Some("Test command"),
             command: move |ctx| {
                 let mut vc = ctx.get_mut(&view_clone);
-                println!("Execute {vc:?}");
                 vc.0 += 4;
             },
             views: &[&view.as_mut(4)]
         });
 
-        //let mapping1 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
+        let mapping1 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
         
-        if true {
-            let view_clone = view.clone();
-            command_buffer.schedule(CommandDescriptor {
-                label: Some("Test command"),
-                command: move |ctx| {
-                    let mut vc = ctx.get_mut(&view_clone);
-                    println!("Execute2 {vc:?}");
-                    vc.0 += 2;
-                },
-                views: &[&view.as_mut(2)]
-            });
-        }
+        let view_clone = view.clone();
+        command_buffer.schedule(CommandDescriptor {
+            label: Some("Test command"),
+            command: move |ctx| {
+                let mut vc = ctx.get_mut(&view_clone);
+                vc.0 += 2;
+            },
+            views: &[&view.as_mut(2)]
+        });
 
         let mapping2 = command_buffer.map(&data.view::<DoubledInt32>().as_const());
         ctx.submit(Some(command_buffer));
 
-        //let value = ctx.get(&mapping1);
-        //println!("Mapped {}", value.0);
-        //drop(value);
-        //drop(mapping1);
+        let value = ctx.get(&mapping1);
+        assert_eq!(value.0, 54);
+        drop(value);
+        drop(mapping1);
         let value = ctx.get(&mapping2);
-        println!("Mapped {}", value.0);
+        assert_eq!(value.0, 58);
         drop(value);
         drop(mapping2);
+    }
+
+    #[test]
+    fn test_skip_irrelevant_command() {
+        let execution_count = Arc::new(AtomicU32::new(0));
+        let ctx = DataFrostContext::new(ContextDescriptor { label: Some("my context") });
+        let data = ctx.allocate::<Int32>(AllocationDescriptor {
+            descriptor: IntDescriptor { initial_value: 23 },
+            label: Some("my int"),
+            derived_formats: &[&Derived::new(DoubleIntDerive)]
+        });
+        
+        let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
+        let view = data.view::<Int32>();
+        
+        let ex_clone = execution_count.clone();
+        let view_clone = view.clone();
+        command_buffer.schedule(CommandDescriptor {
+            label: Some("Test command"),
+            command: move |ctx| {
+                let mut vc = ctx.get_mut(&view_clone);
+                vc.0 += 4;
+                ex_clone.fetch_add(1, Ordering::Relaxed);
+            },
+            views: &[&view.as_mut(4)]
+        });
+        
+        let ex_clone = execution_count.clone();
+        command_buffer.schedule(CommandDescriptor {
+            label: Some("Test command"),
+            command: move |_| {
+                ex_clone.fetch_add(1, Ordering::Relaxed);
+            },
+            views: &[&view.as_const()]
+        });
+
+        let mapping = command_buffer.map(&data.view::<DoubledInt32>().as_const());
+        ctx.submit(Some(command_buffer));
+
+        ctx.get(&mapping);
+        assert_eq!(execution_count.load(Ordering::Relaxed), 1);
     }
 }
