@@ -9,7 +9,7 @@ pub struct NumberArray;
 /// Defines the layout of an array of numbers.
 pub struct NumberArrayDescriptor {
     /// The length of the array.
-    pub len: usize
+    pub len: usize,
 }
 
 impl Kind for NumberArray {
@@ -25,7 +25,7 @@ impl Format for PrimaryArray {
     type Kind = NumberArray;
 
     fn allocate(descriptor: &NumberArrayDescriptor) -> Self {
-        Self(vec!(0; descriptor.len))
+        Self(vec![0; descriptor.len])
     }
 }
 
@@ -38,7 +38,7 @@ impl Format for DoubledArray {
     type Kind = NumberArray;
 
     fn allocate(descriptor: &NumberArrayDescriptor) -> Self {
-        Self(vec!(0; descriptor.len))
+        Self(vec![0; descriptor.len])
     }
 }
 
@@ -67,7 +67,7 @@ impl DerivedDescriptor<PrimaryArray> for DoublePrimaryArray {
 fn main() {
     // Create a new context.
     let ctx = DataFrostContext::new(ContextDescriptor {
-        label: Some("my context")
+        label: Some("my context"),
     });
 
     // Allocate a new primary array object, which has a doubled
@@ -75,12 +75,14 @@ fn main() {
     let data = ctx.allocate::<PrimaryArray>(AllocationDescriptor {
         descriptor: NumberArrayDescriptor { len: 7 },
         label: Some("my data"),
-        derived_formats: &[&Derived::new(DoublePrimaryArray)]
+        derived_formats: &[&Derived::new(DoublePrimaryArray)],
     });
 
     // Create a command buffer to record operations to execute
     // on our data.
-    let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor { label: Some("my command buffer") });
+    let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor {
+        label: Some("my command buffer"),
+    });
 
     // Schedule a command to fill the primary number array with some data.
     let view = data.view::<PrimaryArray>();
@@ -88,7 +90,7 @@ fn main() {
     command_buffer.schedule(CommandDescriptor {
         label: Some("fill array"),
         views: &[&view.as_mut(4..6)],
-        command: move |ctx| ctx.get_mut(&view_clone).0[4..6].fill(33)
+        command: move |ctx| ctx.get_mut(&view_clone).0[4..6].fill(33),
     });
 
     // Schedule a command to map the contents of the derived acceleration structure

@@ -13,7 +13,7 @@ pub struct DirectedAcyclicGraph<T> {
     /// The list of nodes in the graph.
     nodes: Slab<NodeEntry<T>>,
     /// Holds linked lists of parents and children within the graph.
-    relatives: Slab<NodeListEntry>
+    relatives: Slab<NodeListEntry>,
 }
 
 impl<T> DirectedAcyclicGraph<T> {
@@ -26,7 +26,7 @@ impl<T> DirectedAcyclicGraph<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             nodes: Slab::with_capacity(capacity),
-            relatives: Slab::with_capacity(capacity * (capacity + 1) / 2)
+            relatives: Slab::with_capacity(capacity * (capacity + 1) / 2),
         }
     }
 
@@ -42,17 +42,17 @@ impl<T> DirectedAcyclicGraph<T> {
         let mut first_parent = u16::MAX;
         for &parent in parents {
             self.add_child_to_parent(parent, node);
-            
+
             first_parent = self.relatives.insert(NodeListEntry {
                 node: parent,
-                next_entry: first_parent
+                next_entry: first_parent,
             }) as u16;
         }
 
         self.nodes.insert(NodeEntry {
             value,
             first_child_entry: u16::MAX,
-            first_parent_entry: first_parent
+            first_parent_entry: first_parent,
         });
 
         node
@@ -66,7 +66,10 @@ impl<T> DirectedAcyclicGraph<T> {
     /// Removes a node from the graph. The node is assumed to have no parents.
     pub fn pop(&mut self, node: NodeId) -> T {
         let result = self.nodes.remove(node.0 as usize);
-        assert!(result.first_parent_entry == u16::MAX, "Cannot pop node that has dependencies.");
+        assert!(
+            result.first_parent_entry == u16::MAX,
+            "Cannot pop node that has dependencies."
+        );
 
         let mut current_entry = result.first_child_entry;
         while current_entry != u16::MAX {
@@ -83,7 +86,7 @@ impl<T> DirectedAcyclicGraph<T> {
     pub fn children(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
         DirectedAcyclicGraphIter {
             graph: self,
-            current_entry: self.nodes[node.0 as usize].first_child_entry
+            current_entry: self.nodes[node.0 as usize].first_child_entry,
         }
     }
 
@@ -91,7 +94,7 @@ impl<T> DirectedAcyclicGraph<T> {
     pub fn parents(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
         DirectedAcyclicGraphIter {
             graph: self,
-            current_entry: self.nodes[node.0 as usize].first_parent_entry
+            current_entry: self.nodes[node.0 as usize].first_parent_entry,
         }
     }
 
@@ -100,14 +103,20 @@ impl<T> DirectedAcyclicGraph<T> {
     pub fn add_parent(&mut self, parent: NodeId, node: NodeId) {
         self.add_child_to_parent(parent, node);
         let node = &mut self.nodes[node.0 as usize];
-        let new_entry = self.relatives.insert(NodeListEntry { node: parent, next_entry: node.first_parent_entry });
+        let new_entry = self.relatives.insert(NodeListEntry {
+            node: parent,
+            next_entry: node.first_parent_entry,
+        });
         node.first_parent_entry = new_entry as u16;
     }
 
     /// Adds the provided child to the front of the parent's child list.
     fn add_child_to_parent(&mut self, parent: NodeId, node: NodeId) {
         let parent_node = &mut self.nodes[parent.0 as usize];
-        let new_entry = self.relatives.insert(NodeListEntry { node, next_entry: parent_node.first_child_entry });
+        let new_entry = self.relatives.insert(NodeListEntry {
+            node,
+            next_entry: parent_node.first_child_entry,
+        });
         parent_node.first_child_entry = new_entry as u16;
     }
 
@@ -118,7 +127,9 @@ impl<T> DirectedAcyclicGraph<T> {
 
         while next_entry.node != parent {
             let key = *last_entry;
-            let (current, next) = self.relatives.get2_mut(key as usize, next_entry.next_entry as usize)
+            let (current, next) = self
+                .relatives
+                .get2_mut(key as usize, next_entry.next_entry as usize)
                 .expect("Failed to get relative nodes.");
             next_entry = *next;
             last_entry = &mut current.next_entry;
@@ -155,7 +166,7 @@ pub struct DirectedAcyclicGraphIter<'a, T> {
     /// The graph to iterate.
     graph: &'a DirectedAcyclicGraph<T>,
     /// The index of the current entry in a linked list of entries.
-    current_entry: u16
+    current_entry: u16,
 }
 
 impl<'a, T> Iterator for DirectedAcyclicGraphIter<'a, T> {
@@ -174,21 +185,22 @@ impl<'a, T> Iterator for DirectedAcyclicGraphIter<'a, T> {
 #[derive(Debug, Default)]
 pub struct DirectedAcyclicGraphFlags {
     /// The inner set of flas.
-    flags: BitVec
+    flags: BitVec,
 }
 
 impl DirectedAcyclicGraphFlags {
     /// Creates a new set of graph flags.
     pub fn new() -> Self {
         Self {
-            flags: BitVec::new()
+            flags: BitVec::new(),
         }
     }
 
     /// Resizes to hold data about all of the nodes in the provided graph.
     /// Any newly-created nodes are assigned the value of `false`.
     pub fn resize_for<T>(&mut self, graph: &DirectedAcyclicGraph<T>) {
-        self.flags.resize(self.flags.len().max(graph.nodes.capacity()), false);
+        self.flags
+            .resize(self.flags.len().max(graph.nodes.capacity()), false);
     }
 
     /// Sets a flag on the provided node.
@@ -223,7 +235,7 @@ struct NodeEntry<T> {
     /// The ID of the first child in the relatives list, if any.
     pub first_child_entry: u16,
     /// The ID of the first parent in the relatives list, if any.
-    pub first_parent_entry: u16
+    pub first_parent_entry: u16,
 }
 
 /// Represents an entry in a linked list of nodes.
@@ -232,5 +244,5 @@ struct NodeListEntry {
     /// The ID of the node.
     pub node: NodeId,
     /// The next entry in the list.
-    pub next_entry: u16
+    pub next_entry: u16,
 }

@@ -11,7 +11,7 @@ pub struct DynEntry<T: 'static + ?Sized> {
     /// The ID of the vector.
     vec_id: u64,
     /// The offset of the entry within the vector.
-    offset: *mut T
+    offset: *mut T,
 }
 
 impl<T: 'static + ?Sized> Clone for DynEntry<T> {
@@ -26,7 +26,9 @@ impl<T: 'static + ?Sized> Copy for DynEntry<T> {}
 
 impl<T: 'static + ?Sized> std::fmt::Debug for DynEntry<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple(type_name::<DynEntry<T>>()).field(&self.offset).finish()
+        f.debug_tuple(type_name::<DynEntry<T>>())
+            .field(&self.offset)
+            .finish()
     }
 }
 
@@ -49,7 +51,7 @@ pub struct DynVec {
     /// The position of the last entry in the vector.
     last_entry: usize,
     /// The ID of the vector.
-    id: u64
+    id: u64,
 }
 
 impl DynVec {
@@ -67,12 +69,19 @@ impl DynVec {
             let capacity = capacity.next_multiple_of(INITIAL_ALIGNMENT);
 
             Self {
-                inner: if capacity > 0 { alloc(Layout::from_size_align_unchecked(capacity, INITIAL_ALIGNMENT)) } else { null_mut() },
+                inner: if capacity > 0 {
+                    alloc(Layout::from_size_align_unchecked(
+                        capacity,
+                        INITIAL_ALIGNMENT,
+                    ))
+                } else {
+                    null_mut()
+                },
                 len: 0,
                 alignment: INITIAL_ALIGNMENT,
                 capacity,
                 last_entry: usize::MAX,
-                id: unique_id()
+                id: unique_id(),
             }
         }
     }
@@ -102,7 +111,7 @@ impl DynVec {
             self.get_mut(next_position).write(TypedDynEntry {
                 next: usize::MAX,
                 drop: transmute(TypedDynEntry::<T>::drop_entry as unsafe fn(*mut TypedDynEntry<T>)),
-                value
+                value,
             });
 
             if self.last_entry != usize::MAX {
@@ -110,8 +119,11 @@ impl DynVec {
             }
 
             self.last_entry = next_position;
-            
-            DynEntry { vec_id: self.id, offset: (next_position + offset_of!(TypedDynEntry<T>, value)) as *mut T, }
+
+            DynEntry {
+                vec_id: self.id,
+                offset: (next_position + offset_of!(TypedDynEntry<T>, value)) as *mut T,
+            }
         }
     }
 
@@ -125,16 +137,23 @@ impl DynVec {
                 let old_alignment = self.alignment;
                 self.alignment = layout.align();
                 self.capacity = new_len.next_multiple_of(self.alignment);
-                
-                let new = alloc(Layout::from_size_align_unchecked(self.capacity, self.alignment));
+
+                let new = alloc(Layout::from_size_align_unchecked(
+                    self.capacity,
+                    self.alignment,
+                ));
                 if !self.inner.is_null() {
                     std::ptr::copy_nonoverlapping(self.inner.cast_const(), new, self.len);
-                    dealloc(self.inner, Layout::from_size_align_unchecked(old_capacity, old_alignment));
+                    dealloc(
+                        self.inner,
+                        Layout::from_size_align_unchecked(old_capacity, old_alignment),
+                    );
                 }
                 self.inner = new;
             }
 
-            self.len += Layout::from_size_align_unchecked(self.inner.add(self.len) as usize, 1).padding_needed_for(layout.align());
+            self.len += Layout::from_size_align_unchecked(self.inner.add(self.len) as usize, 1)
+                .padding_needed_for(layout.align());
             let position = self.len;
             self.len += layout.size();
             position
@@ -142,9 +161,9 @@ impl DynVec {
     }
 
     /// Gets a mutable reference to an object of type `T` at `offset` bytes into the vector.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The entirety of the object at the offset must be within the vector's bounds
     /// and satisfy the alignment of `T`.
     unsafe fn get_mut<T: 'static>(&mut self, offset: usize) -> &mut MaybeUninit<T> {
@@ -163,8 +182,14 @@ impl<T: ?Sized> Index<DynEntry<T>> for DynVec {
 
     fn index(&self, index: DynEntry<T>) -> &Self::Output {
         unsafe {
-            assert!(self.id == index.vec_id, "Attempted to get dynamic entry from different vector.");
-            &*from_raw_parts(self.inner.add(index.offset.cast::<u8>() as usize).cast(), metadata(index.offset))
+            assert!(
+                self.id == index.vec_id,
+                "Attempted to get dynamic entry from different vector."
+            );
+            &*from_raw_parts(
+                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
+                metadata(index.offset),
+            )
         }
     }
 }
@@ -172,8 +197,14 @@ impl<T: ?Sized> Index<DynEntry<T>> for DynVec {
 impl<T: ?Sized> IndexMut<DynEntry<T>> for DynVec {
     fn index_mut(&mut self, index: DynEntry<T>) -> &mut Self::Output {
         unsafe {
-            assert!(self.id == index.vec_id, "Attempted to get dynamic entry from different vector.");
-            &mut *from_raw_parts_mut(self.inner.add(index.offset.cast::<u8>() as usize).cast(), metadata(index.offset))
+            assert!(
+                self.id == index.vec_id,
+                "Attempted to get dynamic entry from different vector."
+            );
+            &mut *from_raw_parts_mut(
+                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
+                metadata(index.offset),
+            )
         }
     }
 }
@@ -182,7 +213,10 @@ impl Drop for DynVec {
     fn drop(&mut self) {
         unsafe {
             self.clear();
-            dealloc(self.inner, Layout::from_size_align_unchecked(self.capacity, self.alignment));
+            dealloc(
+                self.inner,
+                Layout::from_size_align_unchecked(self.capacity, self.alignment),
+            );
         }
     }
 }
@@ -199,7 +233,7 @@ struct TypedDynEntry<T: 'static> {
     /// The function that should be used to drop the object.
     drop: unsafe fn(*mut ()),
     /// The value of the object.
-    value: T
+    value: T,
 }
 
 impl<T: 'static> TypedDynEntry<T> {
