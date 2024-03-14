@@ -26,7 +26,7 @@
 //! The following is an abridged example of how to use `datafrost`. The full code may be found in the
 //! [examples folder](/examples/derived.rs). To begin, we define the data formats that our code will use:
 //!
-//! ```rust
+//! ```ignore
 //! use datafrost::*;
 //! use std::ops::*;
 //!
@@ -79,7 +79,7 @@
 //! Now that our data and its derived formats are defined, we can create instances of
 //! it and schedule commands to act upon the data:
 //!
-//! ```rust
+//! ```ignore
 //! // Create a new context.
 //! let ctx = DataFrostContext::new(ContextDescriptor {
 //!     label: Some("my context")
@@ -224,6 +224,13 @@ impl CommandBuffer {
         &mut self,
         view: &ViewDescriptor<M, F>,
     ) -> Mapped<M, F> {
+        assert!(
+            TypeId::of::<M>() == TypeId::of::<Const>() || !view.view.derived,
+            "Attempted to mutably map derived view of object{} in command buffer{}",
+            FormattedLabel(" ", view.view.inner.inner.label, ""),
+            FormattedLabel(" ", self.label, "")
+        );
+
         let inner = Arc::new(MappedInner {
             context_id: view.view.inner.inner.context_id,
             command_context: UnsafeCell::new(MaybeUninit::uninit()),
@@ -618,6 +625,12 @@ impl std::fmt::Debug for DataFrostContext {
     }
 }
 
+impl Default for DataFrostContext {
+    fn default() -> Self {
+        Self::new(ContextDescriptor::default())
+    }
+}
+
 impl WorkProvider for DataFrostContext {
     fn change_notifier(&self) -> &ChangeNotifier {
         &self.holder.change_notifier
@@ -740,6 +753,14 @@ where
             .field(&type_name::<F>())
             .field(&self.inner)
             .finish()
+    }
+}
+
+impl<F: Format> Deref for View<F> {
+    type Target = <F::Kind as Kind>::FormatDescriptor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner.inner.descriptor
     }
 }
 
@@ -1198,10 +1219,18 @@ impl ContextInner {
     /// and returns it. Prioritizes critical nodes.
     fn pop_command(&mut self) -> Option<NodeId> {
         if let Some(node) = self.critical_top_level_nodes.first_set_node() {
+            debug_assert!(
+                self.compute_graph.parents(node).next().is_none(),
+                "Attempted to pop non-parent node."
+            );
             self.critical_top_level_nodes.set(node, false);
             self.top_level_nodes.set(node, false);
             Some(node)
         } else if let Some(node) = self.top_level_nodes.first_set_node() {
+            debug_assert!(
+                self.compute_graph.parents(node).next().is_none(),
+                "Attempted to pop non-parent node."
+            );
             self.top_level_nodes.set(node, false);
             Some(node)
         } else {
@@ -1254,7 +1283,6 @@ impl ContextInner {
                 .command_list
                 .clone();
             let node = self.compute_graph.vacant_node();
-
             // Iterate over all used views to find any conflicting computations
 
             self.temporary_node_buffer.clear();
@@ -1417,6 +1445,13 @@ impl ContextInner {
                 }
             }
 
+            let top_level = if self.temporary_node_buffer.is_empty() {
+                self.top_level_nodes.set(node, true);
+                true
+            } else {
+                false
+            };
+
             if let Computation::Map { inner } = computation {
                 assert!(
                     inner.as_ref().unwrap_unchecked().context_id == self.context_id,
@@ -1427,12 +1462,7 @@ impl ContextInner {
 
             self.active_command_buffers[command_buffer_id as usize].remaining_commands += 1;
 
-            if self.temporary_node_buffer.is_empty() {
-                self.top_level_nodes.set(node, true);
-                true
-            } else {
-                false
-            }
+            top_level
         }
     }
 
