@@ -106,7 +106,7 @@ command_buffer.schedule(CommandDescriptor {
 let derived = command_buffer.map(&data.view::<DoubledArray>().as_const());
 
 // Submit the buffer for processing.
-ctx.submit(Some(command_buffer));
+ctx.submit(command_buffer);
 
 // The doubled acceleration structure automatically contains the
 // correct, up-to-date data!

@@ -90,7 +90,7 @@
 //! let data = ctx.allocate::<PrimaryArray>(AllocationDescriptor {
 //!     descriptor: NumberArrayDescriptor { len: 7 },
 //!     label: Some("my data"),
-//!     derived_formats: &[&Derived::new(DoublePrimaryArray)]
+//!     derived_formats: &[Derived::new(DoublePrimaryArray)]
 //! });
 //!
 //! // Create a command buffer to record operations to execute
@@ -193,7 +193,7 @@ pub struct AllocationDescriptor<'a, F: Format> {
     /// An optional label to associate with the object.
     pub label: Option<&'static str>,
     /// Derived formats that should be set up to track the parent format.
-    pub derived_formats: &'a [&'a Derived<F>],
+    pub derived_formats: &'a [Derived<F>],
 }
 
 /// Records a list of operations that should be executed on formatted data.
@@ -219,6 +219,22 @@ impl CommandBuffer {
         }
     }
 
+    /// Requires that all referenced views are available and ready
+    /// at this point in the buffer.
+    pub fn fence(&mut self, views: &[&dyn ViewUsage]) {
+        let computation = SyncUnsafeCell::new(Some(Computation::Execute {
+            command: self.command_list.push(()),
+        }));
+        let first_view_entry = self.push_views(views);
+        let next_command = self.command_list.push(CommandEntry {
+            computation,
+            first_view_entry,
+            label: Some("Fence"),
+            next_instance: None,
+        });
+        self.update_first_last_command_entries(next_command);
+    }
+
     /// Maps a format for synchronous viewing.
     pub fn map<M: UsageMutability, F: Format>(
         &mut self,
@@ -234,7 +250,8 @@ impl CommandBuffer {
         let inner = Arc::new(MappedInner {
             context_id: view.view.inner.inner.context_id,
             command_context: UnsafeCell::new(MaybeUninit::uninit()),
-            mapped: AtomicBool::new(false),
+            label: view.view.inner.inner.label,
+            map_state: MapObjectState::default(),
         });
 
         let computation = SyncUnsafeCell::new(Some(Computation::Map {
@@ -326,19 +343,38 @@ pub struct CommandBufferDescriptor {
     pub label: Option<&'static str>,
 }
 
+/// Describes the present status of a submitted command buffer.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CommandBufferStatus {
+    /// The number of commands left to process in this command buffer.
+    pub incomplete_commands: u32,
+}
+
+impl CommandBufferStatus {
+    /// Whether all commands in this command buffer have been processed.
+    pub fn complete(&self) -> bool {
+        self.incomplete_commands == 0
+    }
+}
+
+/// Uniquely identifies a submitted command buffer,
+/// allowing one to query its completion status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommandBufferSubmission {
+    /// The unique ID of the command buffer.
+    unique_id: u64,
+    /// The ID of the context that created this command buffer.
+    context_id: u64,
+    /// The ID of the command buffer within the `Slab`.
+    command_buffer_id: u16,
+}
+
 /// Allows for interacting with format data during command execution.
 /// When this object is dropped, a command is considered complete.
+
 pub struct CommandContext {
-    /// The ID of the command that is currently executing.
-    command_id: NodeId,
-    /// A reference to the context.
-    context: Arc<ContextHolder>,
-    /// An optional label describing the command.
-    label: Option<&'static str>,
-    /// An optional label describing the command buffer.
-    command_buffer_label: Option<&'static str>,
-    /// The list of views that this context references.
-    views: Vec<CommandContextView>,
+    /// The inner context state.
+    inner: ManuallyDrop<CommandContextInner>,
 }
 
 impl CommandContext {
@@ -363,6 +399,7 @@ impl CommandContext {
     fn find_view<M: Mutability, F: Format>(&self, view: &View<F>) -> &RwCell<*mut ()> {
         let mutable = TypeId::of::<Mut>() == TypeId::of::<M>();
         if let Some(command_view) = self
+            .inner
             .views
             .iter()
             .find(|x| x.id == view.id && x.mutable == mutable)
@@ -372,8 +409,12 @@ impl CommandContext {
             panic!(
                 "View{} was not referenced by command{}{}",
                 FormattedLabel(" ", view.inner.inner.label, ""),
-                FormattedLabel(" ", self.label, ""),
-                FormattedLabel(" (from command buffer ", self.command_buffer_label, ")")
+                FormattedLabel(" ", self.inner.label, ""),
+                FormattedLabel(
+                    " (from command buffer ",
+                    self.inner.command_buffer_label,
+                    ")"
+                )
             );
         }
     }
@@ -387,11 +428,15 @@ impl std::fmt::Debug for CommandContext {
 
 impl Drop for CommandContext {
     fn drop(&mut self) {
-        self.context
-            .inner
-            .lock()
-            .expect("Failed to lock context.")
-            .complete_command(self.command_id, &self.context);
+        unsafe {
+            self.inner
+                .context
+                .inner
+                .lock()
+                .expect("Failed to lock context.")
+                .complete_command(self.inner.command_id, &self.inner.context);
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 
@@ -512,7 +557,7 @@ impl DataFrostContext {
         let (object_update_sender, object_updates) = channel();
 
         let change_notifier = ChangeNotifier::default();
-        let change_listener = CondvarNotificationListener::new(&change_notifier);
+        let change_listener = Condvar::new();
         let context_id = unique_id();
         let inner = Mutex::new(ContextInner {
             active_command_buffers: Slab::new(),
@@ -550,26 +595,7 @@ impl DataFrostContext {
         mapping: &'a Mapped<M, F>,
     ) -> ViewRef<'a, Const, F> {
         unsafe {
-            assert!(
-                mapping.inner.context_id == self.holder.context_id,
-                "Mapping was not from this context."
-            );
-
-            if !mapping.inner.mapped.load(Ordering::Acquire) {
-                let mut inner = self.inner();
-                while !mapping.inner.mapped.load(Ordering::Acquire) {
-                    match inner.prepare_next_command(&self.holder) {
-                        Some(Some(command)) => {
-                            drop(inner);
-                            command.execute();
-                            inner = self.inner();
-                        }
-                        Some(None) => continue,
-                        None => inner = self.holder.change_listener.wait(inner),
-                    }
-                }
-            }
-
+            self.wait_for_mapping(mapping);
             return (*mapping.inner.command_context.get())
                 .assume_init_ref()
                 .get(&mapping.view);
@@ -579,35 +605,32 @@ impl DataFrostContext {
     /// Mutably gets the data referenced by the mapping. This function will block if the mapping is not yet available.
     pub fn get_mut<'a, F: Format>(&self, mapping: &'a mut Mapped<Mut, F>) -> ViewRef<'a, Mut, F> {
         unsafe {
-            assert!(
-                mapping.inner.context_id == self.holder.context_id,
-                "Mapping was not from this context."
-            );
-
-            if !mapping.inner.mapped.load(Ordering::Acquire) {
-                let mut inner = self.inner();
-                while !mapping.inner.mapped.load(Ordering::Acquire) {
-                    match inner.prepare_next_command(&self.holder) {
-                        Some(Some(command)) => {
-                            drop(inner);
-                            command.execute();
-                            inner = self.inner();
-                        }
-                        Some(None) => continue,
-                        None => inner = self.holder.change_listener.wait(inner),
-                    }
-                }
-            }
-
+            self.wait_for_mapping(mapping);
             return (*mapping.inner.command_context.get())
                 .assume_init_mut()
                 .get_mut(&mapping.view);
         }
     }
 
+    /// Checks the current status of an executing command buffer.
+    pub fn query(&self, submission: &CommandBufferSubmission) -> CommandBufferStatus {
+        assert!(
+            submission.context_id == self.holder.context_id,
+            "Submission was not owned by this context."
+        );
+        self.inner()
+            .active_command_buffers
+            .get(submission.command_buffer_id as usize)
+            .filter(|x| x.unique_id == submission.unique_id)
+            .map(|x| CommandBufferStatus {
+                incomplete_commands: x.remaining_commands,
+            })
+            .unwrap_or_default()
+    }
+
     /// Schedules the provided command buffer for execution.
-    pub fn submit(&self, buffers: impl IntoIterator<Item = CommandBuffer>) {
-        self.inner().submit(buffers, &self.holder);
+    pub fn submit(&self, buffer: CommandBuffer) -> CommandBufferSubmission {
+        self.inner().submit(buffer, &self.holder)
     }
 
     /// Gets the inner data of this context.
@@ -616,6 +639,57 @@ impl DataFrostContext {
             .inner
             .lock()
             .expect("Failed to obtain inner context.")
+    }
+
+    /// Waits for a mapping to become available.
+    fn wait_for_mapping<M: Mutability, F: Format>(&self, mapping: &Mapped<M, F>) {
+        unsafe {
+            assert!(
+                mapping.inner.context_id == self.holder.context_id,
+                "Mapping was not from this context."
+            );
+
+            let query = mapping.inner.map_state.get();
+            if query.queued {
+                if !query.complete {
+                    let mut inner = self.inner();
+                    while !mapping.inner.map_state.get().complete {
+                        if inner.top_level_nodes.get(query.node) {
+                            inner.critical_top_level_nodes.set(query.node, false);
+                            inner.top_level_nodes.set(query.node, false);
+                            inner.compute_graph[query.node].computation =
+                                Computation::Map { inner: None };
+                            *mapping.inner.command_context.get() = MaybeUninit::new(
+                                inner.create_command_context(&self.holder, query.node),
+                            );
+                            mapping.inner.map_state.set_complete();
+                            return;
+                        }
+
+                        match inner.prepare_next_command::<true>(&self.holder) {
+                            Some(Some(command)) => {
+                                drop(inner);
+                                command.execute();
+                                inner = self.inner();
+                            }
+                            Some(None) => continue,
+                            None => {
+                                inner = self
+                                    .holder
+                                    .change_listener
+                                    .wait(inner)
+                                    .expect("Failed to lock mutex.")
+                            }
+                        }
+                    }
+                }
+            } else {
+                panic!(
+                    "Attempted to map object{} before submitting the associated command buffer.",
+                    FormattedLabel(" ", mapping.inner.label, "")
+                )
+            }
+        }
     }
 }
 
@@ -639,7 +713,7 @@ impl WorkProvider for DataFrostContext {
     fn next_task(&self) -> Option<Box<dyn '_ + WorkUnit>> {
         let mut inner = self.inner();
         loop {
-            match inner.prepare_next_command(&self.holder) {
+            match inner.prepare_next_command::<false>(&self.holder) {
                 Some(Some(command)) => return Some(command),
                 Some(None) => continue,
                 None => return None,
@@ -865,6 +939,10 @@ trait ViewHolder: 'static + Send + Sync {
     fn usage(&self) -> *const ();
 }
 
+impl ExecutableCommand for () {
+    unsafe fn execute(&self, _: CommandContext) {}
+}
+
 impl<F: 'static + Send + Sync + FnOnce(CommandContext)> ExecutableCommand
     for SyncUnsafeCell<Option<F>>
 {
@@ -881,6 +959,22 @@ struct ActiveCommandBuffer {
     label: Option<&'static str>,
     /// The set of commands that are left before this command buffer may be discarded.
     remaining_commands: u32,
+    /// A unique ID identifying this buffer instance.
+    unique_id: u64,
+}
+
+/// Holds the inner state for a command context.
+struct CommandContextInner {
+    /// The ID of the command that is currently executing.
+    pub command_id: NodeId,
+    /// A reference to the context.
+    pub context: Arc<ContextHolder>,
+    /// An optional label describing the command.
+    pub label: Option<&'static str>,
+    /// An optional label describing the command buffer.
+    pub command_buffer_label: Option<&'static str>,
+    /// The list of views that this context references.
+    pub views: Vec<CommandContextView>,
 }
 
 /// Stores information about a view accessible from a command context.
@@ -953,38 +1047,12 @@ struct ComputationViewReference {
     pub view_holder: DynEntry<dyn ViewHolder>,
 }
 
-/// Wakes all threads from a [`Condvar`] upon being signalled by
-/// a [`ChangeNotifier`].
-struct CondvarNotificationListener {
-    /// A handle to the listener from the change notifier.
-    #[allow(unused)]
-    handle: ChangeNotificationListener,
-    /// The conditional upon which to wait.
-    inner: Arc<Condvar>,
-}
-
-impl CondvarNotificationListener {
-    /// Creates a new notification listener and attaches it to the provided [`ChangeNotifier`].
-    pub fn new(notifier: &ChangeNotifier) -> Self {
-        let inner = Arc::new(Condvar::new());
-        let inner_clone = inner.clone();
-        let handle = notifier.add_listener(move || inner_clone.notify_all());
-
-        Self { handle, inner }
-    }
-
-    /// Waits for a signal from the change notifier.
-    pub unsafe fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-        self.inner.wait(guard).unwrap_unchecked()
-    }
-}
-
 /// Holds the inner data for a context.
 struct ContextHolder {
     /// The notifier to use when new work is available from the context.
     change_notifier: ChangeNotifier,
     /// The listener to use when waiting for changes from the context.
-    change_listener: CondvarNotificationListener,
+    change_listener: Condvar,
     /// The ID of the context.
     context_id: u64,
     /// The inner mutable context data.
@@ -1098,21 +1166,17 @@ impl ContextInner {
     /// Schedules the provided command buffer for execution.
     pub fn submit(
         &mut self,
-        buffers: impl IntoIterator<Item = CommandBuffer>,
+        buffer: CommandBuffer,
         context: &ContextHolder,
-    ) {
+    ) -> CommandBufferSubmission {
         self.update_objects();
-        let mut added_top_level_node = false;
-        for buffer in buffers {
-            added_top_level_node |= self.submit_buffer(buffer);
-        }
+        let (submission, added_top_level_node) = self.submit_buffer(buffer);
         self.critical_top_level_nodes
             .and(&self.critical_nodes, &self.top_level_nodes);
-
-        if added_top_level_node && self.stalled {
-            self.stalled = false;
-            context.change_notifier.notify();
+        if added_top_level_node {
+            self.notify_new_top_level_commands(context);
         }
+        submission
     }
 
     /// Creates a command context to execute the provided computation.
@@ -1123,31 +1187,34 @@ impl ContextInner {
     ) -> CommandContext {
         let computation = &self.compute_graph[command_id];
         CommandContext {
-            command_id,
-            command_buffer_label: self.active_command_buffers[computation.command_buffer as usize]
-                .label,
-            context: context.clone(),
-            label: computation.label,
-            views: computation
-                .views
-                .iter()
-                .map(|x| CommandContextView {
-                    id: x.id,
-                    mutable: x.mutable,
-                    value: RwCell::new(self.objects[x.id as usize].value.get().cast()),
-                })
-                .collect(),
+            inner: ManuallyDrop::new(CommandContextInner {
+                command_id,
+                command_buffer_label: self.active_command_buffers
+                    [computation.command_buffer as usize]
+                    .label,
+                context: context.clone(),
+                label: computation.label,
+                views: computation
+                    .views
+                    .iter()
+                    .map(|x| CommandContextView {
+                        id: x.id,
+                        mutable: x.mutable,
+                        value: RwCell::new(self.objects[x.id as usize].value.get().cast()),
+                    })
+                    .collect(),
+            }),
         }
     }
 
     /// Attempts to get the next command to execute. Returns `None` if no work is presently available,
     /// `Some(None)` if new mappings were made available, and `Some(Some(_))` if work must be done.
-    fn prepare_next_command(
+    fn prepare_next_command<const CRITICAL_ONLY: bool>(
         &mut self,
         context: &Arc<ContextHolder>,
     ) -> Option<Option<Box<dyn WorkUnit>>> {
         unsafe {
-            if let Some(node) = self.pop_command() {
+            if let Some(node) = self.pop_command::<CRITICAL_ONLY>() {
                 let ctx = self.create_command_context(context, node);
                 let computation = &mut self.compute_graph[node];
 
@@ -1163,7 +1230,15 @@ impl ContextInner {
                     Computation::Map { inner } => {
                         let value = take(inner).unwrap_unchecked();
                         *value.command_context.get() = MaybeUninit::new(ctx);
-                        value.mapped.store(true, Ordering::Release);
+                        value.map_state.set_complete();
+
+                        if let Some(mut value) = Arc::into_inner(value) {
+                            self.complete_command(node, context);
+                            let command_context = value.command_context.get_mut().assume_init_mut();
+                            ManuallyDrop::drop(&mut command_context.inner);
+                            forget(value);
+                        }
+
                         Some(None)
                     }
                     Computation::Update { object, updates } => {
@@ -1217,7 +1292,7 @@ impl ContextInner {
 
     /// Determines the next command to schedule, removes it from the graph,
     /// and returns it. Prioritizes critical nodes.
-    fn pop_command(&mut self) -> Option<NodeId> {
+    fn pop_command<const CRITICAL_ONLY: bool>(&mut self) -> Option<NodeId> {
         if let Some(node) = self.critical_top_level_nodes.first_set_node() {
             debug_assert!(
                 self.compute_graph.parents(node).next().is_none(),
@@ -1226,7 +1301,10 @@ impl ContextInner {
             self.critical_top_level_nodes.set(node, false);
             self.top_level_nodes.set(node, false);
             Some(node)
-        } else if let Some(node) = self.top_level_nodes.first_set_node() {
+        } else if let Some(node) = (!CRITICAL_ONLY)
+            .then(|| self.top_level_nodes.first_set_node())
+            .flatten()
+        {
             debug_assert!(
                 self.compute_graph.parents(node).next().is_none(),
                 "Attempted to pop non-parent node."
@@ -1239,15 +1317,17 @@ impl ContextInner {
     }
 
     /// Schedules all commands in the provided buffer for processing.
-    fn submit_buffer(&mut self, buffer: CommandBuffer) -> bool {
+    fn submit_buffer(&mut self, buffer: CommandBuffer) -> (CommandBufferSubmission, bool) {
         unsafe {
             let mut added_top_level_node = false;
+            let unique_id = unique_id();
 
-            if let Some(first_entry) = buffer.first_command_entry {
+            let command_buffer_id = if let Some(first_entry) = buffer.first_command_entry {
                 let command_buffer_id = self.active_command_buffers.insert(ActiveCommandBuffer {
                     command_list: Arc::new(buffer.command_list),
                     label: buffer.label,
                     remaining_commands: 0,
+                    unique_id,
                 }) as u16;
 
                 let mut command_entry = Some(first_entry);
@@ -1263,9 +1343,19 @@ impl ContextInner {
                         next.first_view_entry,
                     );
                 }
-            }
 
-            added_top_level_node
+                command_buffer_id
+            } else {
+                0
+            };
+
+            let submission = CommandBufferSubmission {
+                command_buffer_id,
+                context_id: self.context_id,
+                unique_id,
+            };
+
+            (submission, added_top_level_node)
         }
     }
 
@@ -1364,9 +1454,6 @@ impl ContextInner {
                 &self.temporary_node_buffer,
             );
 
-            self.top_level_nodes.resize_for(&self.compute_graph);
-            self.critical_nodes.resize_for(&self.compute_graph);
-
             // Update any derived views that this command affects
             for i in 0..self.compute_graph[node].views.len() {
                 let view = &self.compute_graph[node].views[i];
@@ -1445,6 +1532,9 @@ impl ContextInner {
                 }
             }
 
+            self.top_level_nodes.resize_for(&self.compute_graph);
+            self.critical_nodes.resize_for(&self.compute_graph);
+
             let top_level = if self.temporary_node_buffer.is_empty() {
                 self.top_level_nodes.set(node, true);
                 true
@@ -1453,10 +1543,12 @@ impl ContextInner {
             };
 
             if let Computation::Map { inner } = computation {
+                let inner_ref = inner.as_ref().unwrap_unchecked();
                 assert!(
-                    inner.as_ref().unwrap_unchecked().context_id == self.context_id,
+                    inner_ref.context_id == self.context_id,
                     "Attempted to map object in incorrect context."
                 );
+                inner_ref.map_state.set_queued(node);
                 self.mark_critical(node);
             }
 
@@ -1517,9 +1609,8 @@ impl ContextInner {
                 .remove(computation.command_buffer as usize);
         }
 
-        if !self.temporary_node_buffer.is_empty() && self.stalled {
-            self.stalled = false;
-            context.change_notifier.notify();
+        if !self.temporary_node_buffer.is_empty() {
+            self.notify_new_top_level_commands(context);
         }
     }
 
@@ -1539,6 +1630,18 @@ impl ContextInner {
                     }
                 }
             }
+        }
+    }
+
+    /// Notifies all waiting threads that new commands are available for processing.
+    fn notify_new_top_level_commands(&mut self, context: &ContextHolder) {
+        if self.stalled {
+            self.stalled = false;
+            context.change_notifier.notify();
+        }
+
+        if self.critical_top_level_nodes.first_set_node().is_some() {
+            context.change_listener.notify_all();
         }
     }
 }
@@ -1640,8 +1743,10 @@ struct MappedInner {
     pub context_id: u64,
     /// The command context associated with the mapping.
     pub command_context: UnsafeCell<MaybeUninit<CommandContext>>,
-    /// Whether this object has been mapped yet.
-    pub mapped: AtomicBool,
+    /// The label of the object to be mapped.
+    pub label: Option<&'static str>,
+    /// Whether this object has been submitted or mapped yet.
+    pub map_state: MapObjectState,
 }
 
 impl Drop for MappedInner {
@@ -1654,6 +1759,54 @@ impl Drop for MappedInner {
 
 unsafe impl Send for MappedInner {}
 unsafe impl Sync for MappedInner {}
+
+/// Provides the results of a query against a `MapObjectState`.
+struct MapObjectStateQuery {
+    /// Indicates that the mapping is ready to be accessed.
+    pub complete: bool,
+    /// The node ID associated with the mapping, assuming that it has been queued.
+    pub node: NodeId,
+    /// Indicates that the mapping has been submitted for processing.
+    pub queued: bool,
+}
+
+/// Tracks whether an object is presently mapped.
+#[derive(Default)]
+struct MapObjectState(AtomicU32);
+
+impl MapObjectState {
+    /// A flag bit indicating that the mapping has been queued for execution.
+    const MAPPING_QUEUED: u32 = 1 << 16;
+    /// A flag bit indicating that the mapping is completed.
+    const MAPPING_COMPLETE: u32 = 1 << 17;
+
+    /// Moves this mapping to the queued state, and sets the node ID.
+    pub fn set_queued(&self, node: NodeId) {
+        self.0.store(
+            Self::MAPPING_QUEUED | (u16::from(node) as u32),
+            Ordering::Release,
+        );
+    }
+
+    /// Marks this mapping as complete.
+    pub fn set_complete(&self) {
+        self.0.fetch_or(Self::MAPPING_COMPLETE, Ordering::Release);
+    }
+
+    /// Gets the current state of this mapping.
+    pub fn get(&self) -> MapObjectStateQuery {
+        let value = self.0.load(Ordering::Acquire);
+        let complete = (value & Self::MAPPING_COMPLETE) != 0;
+        let queued = (value & Self::MAPPING_QUEUED) != 0;
+        let node = (value as u16).into();
+
+        MapObjectStateQuery {
+            complete,
+            node,
+            queued,
+        }
+    }
+}
 
 /// Notifies the context of an update that has occurred to an object.
 enum ObjectUpdate {
@@ -1693,8 +1846,8 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
 
     unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]) {
         self.descriptor.update(
-            &mut *context.views[1].value.borrow().cast(),
-            &*context.views[0].value.borrow().cast_const().cast(),
+            &mut *context.inner.views[1].value.borrow().cast(),
+            &*context.inner.views[0].value.borrow().cast_const().cast(),
             &*transmute::<_, *const [_]>(usages),
         );
     }
@@ -1794,7 +1947,7 @@ mod tests {
     impl DerivedDescriptor<Primary> for UpdateAccelerationFromPrimary {
         type Format = DerivedAccelerationStructure;
 
-        fn update(&self, data: &mut Self::Format, parent: &Primary, usage: &[&u32]) {
+        fn update(&self, data: &mut Self::Format, parent: &Primary, _usage: &[&u32]) {
             // Do some calculation to update the acceleration structure based upon the
             // how the primary format has been modified.
             data.0 = 2 * parent.0;
@@ -1824,7 +1977,7 @@ mod tests {
             command: |_| {},
         });
 
-        ctx.submit(Some(command_buffer));
+        ctx.submit(command_buffer);
     }
 
     #[test]
@@ -1850,7 +2003,7 @@ mod tests {
             views: &[&view_a.as_const(), &view_b.as_const()],
         });
 
-        ctx.submit(Some(command_buffer));
+        ctx.submit(command_buffer);
     }
 
     #[test]
@@ -1861,7 +2014,7 @@ mod tests {
         let data = ctx.allocate::<Primary>(AllocationDescriptor {
             descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
-            derived_formats: &[&Derived::new(UpdateAccelerationFromPrimary)],
+            derived_formats: &[Derived::new(UpdateAccelerationFromPrimary)],
         });
 
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor {
@@ -1892,7 +2045,7 @@ mod tests {
         });
 
         let mapping2 = command_buffer.map(&data.view::<DerivedAccelerationStructure>().as_const());
-        ctx.submit(Some(command_buffer));
+        ctx.submit(command_buffer);
 
         let value = ctx.get(&mapping1);
         assert_eq!(value.0, 54);
@@ -1913,7 +2066,7 @@ mod tests {
         let data = ctx.allocate::<Primary>(AllocationDescriptor {
             descriptor: DataDescriptor { initial_value: 23 },
             label: Some("my int"),
-            derived_formats: &[&Derived::new(UpdateAccelerationFromPrimary)],
+            derived_formats: &[Derived::new(UpdateAccelerationFromPrimary)],
         });
 
         let mut command_buffer = CommandBuffer::new(CommandBufferDescriptor {
@@ -1943,7 +2096,7 @@ mod tests {
         });
 
         let mapping = command_buffer.map(&data.view::<DerivedAccelerationStructure>().as_const());
-        ctx.submit(Some(command_buffer));
+        ctx.submit(command_buffer);
 
         ctx.get(&mapping);
         assert_eq!(execution_count.load(Ordering::Relaxed), 1);

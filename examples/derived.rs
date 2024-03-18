@@ -75,7 +75,7 @@ fn main() {
     let data = ctx.allocate::<PrimaryArray>(AllocationDescriptor {
         descriptor: NumberArrayDescriptor { len: 7 },
         label: Some("my data"),
-        derived_formats: &[&Derived::new(DoublePrimaryArray)],
+        derived_formats: &[Derived::new(DoublePrimaryArray)],
     });
 
     // Create a command buffer to record operations to execute
@@ -98,7 +98,7 @@ fn main() {
     let derived = command_buffer.map(&data.view::<DoubledArray>().as_const());
 
     // Submit the buffer for processing.
-    ctx.submit(Some(command_buffer));
+    ctx.submit(command_buffer);
 
     // The doubled acceleration structure automatically contains the
     // correct, up-to-date data!

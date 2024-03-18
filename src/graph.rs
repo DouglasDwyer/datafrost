@@ -6,6 +6,18 @@ use std::ops::*;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NodeId(u16);
 
+impl From<u16> for NodeId {
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
+impl From<NodeId> for u16 {
+    fn from(value: NodeId) -> Self {
+        value.0
+    }
+}
+
 /// Used to represent a graph of objects of type `T`
 /// without any cycles.
 #[derive(Clone, Debug)]
