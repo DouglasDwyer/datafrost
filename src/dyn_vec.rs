@@ -213,10 +213,12 @@ impl Drop for DynVec {
     fn drop(&mut self) {
         unsafe {
             self.clear();
-            dealloc(
-                self.inner,
-                Layout::from_size_align_unchecked(self.capacity, self.alignment),
-            );
+            if !self.inner.is_null() {
+                dealloc(
+                    self.inner,
+                    Layout::from_size_align_unchecked(self.capacity, self.alignment),
+                );
+            }
         }
     }
 }
