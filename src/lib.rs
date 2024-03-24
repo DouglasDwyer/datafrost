@@ -568,7 +568,7 @@ impl DataFrostContext {
             objects: Slab::new(),
             object_update_sender,
             object_updates,
-            stalled: false,
+            stalled: true,
             temporary_node_buffer: Vec::new(),
             top_level_nodes: DirectedAcyclicGraphFlags::new(),
         });
