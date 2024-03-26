@@ -104,6 +104,48 @@ impl DynVec {
         }
     }
 
+    /// Gets a reference to the value described by the given entry, without any
+    /// bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// For this function call to be sound, the entry must refer to a valid
+    /// object currently alive in this vector.
+    pub unsafe fn get_unchecked<T: ?Sized>(&self, value: DynEntry<T>) -> &T {
+        #[cfg(debug_assertions)]
+        {
+            &self[value]
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            &*from_raw_parts(
+                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
+                metadata(index.offset),
+            )
+        }
+    }
+
+    /// Gets a reference to the value described by the given entry, without any
+    /// bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// For this function call to be sound, the entry must refer to a valid
+    /// object currently alive in this vector.
+    pub unsafe fn get_unchecked_mut<T: ?Sized>(&mut self, value: DynEntry<T>) -> &mut T {
+        #[cfg(debug_assertions)]
+        {
+            &mut self[value]
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            &mut *from_raw_parts_mut(
+                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
+                metadata(index.offset),
+            )
+        }
+    }
+
     /// Pushes a new object into the dynamic vector, returning a handle to the allocation.
     pub fn push<T: 'static + Send + Sync>(&mut self, value: T) -> DynEntry<T> {
         unsafe {

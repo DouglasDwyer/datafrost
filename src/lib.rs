@@ -126,6 +126,7 @@ use private::*;
 use slab::*;
 use std::any::*;
 use std::cell::*;
+use std::hint::*;
 use std::marker::*;
 use std::mem::*;
 use std::ops::*;
@@ -211,8 +212,11 @@ pub struct CommandBuffer {
 impl CommandBuffer {
     /// Creates a new command buffer with the provided descriptor.
     pub fn new(descriptor: CommandBufferDescriptor) -> Self {
+        /// The default amount of space to allocate for a new command buffer.
+        const DEFAULT_ALLOCATION_SIZE: usize = 2048;
+
         Self {
-            command_list: DynVec::new(),
+            command_list: DynVec::with_capacity(DEFAULT_ALLOCATION_SIZE),
             label: descriptor.label,
             first_command_entry: None,
             last_command_entry: None,
@@ -222,17 +226,19 @@ impl CommandBuffer {
     /// Requires that all referenced views are available and ready
     /// at this point in the buffer.
     pub fn fence(&mut self, views: &[&dyn ViewUsage]) {
-        let computation = SyncUnsafeCell::new(Some(Computation::Execute {
-            command: self.command_list.push(()),
-        }));
-        let first_view_entry = self.push_views(views);
-        let next_command = self.command_list.push(CommandEntry {
-            computation,
-            first_view_entry,
-            label: Some("Fence"),
-            next_instance: None,
-        });
-        self.update_first_last_command_entries(next_command);
+        unsafe {
+            let computation = SyncUnsafeCell::new(Some(Computation::Execute {
+                command: self.command_list.push(()),
+            }));
+            let first_view_entry = self.push_views(views);
+            let next_command = self.command_list.push(CommandEntry {
+                computation,
+                first_view_entry,
+                label: Some("Fence"),
+                next_instance: None,
+            });
+            self.update_first_last_command_entries(next_command);
+        }
     }
 
     /// Maps a format for synchronous viewing.
@@ -240,38 +246,40 @@ impl CommandBuffer {
         &mut self,
         view: &ViewDescriptor<M, F>,
     ) -> Mapped<M, F> {
-        assert!(
-            TypeId::of::<M>() == TypeId::of::<Const>() || !view.view.derived,
-            "Attempted to mutably map derived view of object{} in command buffer{}",
-            FormattedLabel(" ", view.view.inner.inner.label, ""),
-            FormattedLabel(" ", self.label, "")
-        );
+        unsafe {
+            assert!(
+                TypeId::of::<M>() == TypeId::of::<Const>() || !view.view.derived,
+                "Attempted to mutably map derived view of object{} in command buffer{}",
+                FormattedLabel(" ", view.view.inner.inner.label, ""),
+                FormattedLabel(" ", self.label, "")
+            );
 
-        let inner = Arc::new(MappedInner {
-            context_id: view.view.inner.inner.context_id,
-            command_context: UnsafeCell::new(MaybeUninit::uninit()),
-            label: view.view.inner.inner.label,
-            map_state: MapObjectState::default(),
-        });
+            let inner = Arc::new(MappedInner {
+                context_id: view.view.inner.inner.context_id,
+                command_context: UnsafeCell::new(MaybeUninit::uninit()),
+                label: view.view.inner.inner.label,
+                map_state: MapObjectState::default(),
+            });
 
-        let computation = SyncUnsafeCell::new(Some(Computation::Map {
-            inner: Some(inner.clone()),
-        }));
+            let computation = SyncUnsafeCell::new(Some(Computation::Map {
+                inner: Some(inner.clone()),
+            }));
 
-        let first_view_entry = self.push_views(&[view]);
-        let next_command = self.command_list.push(CommandEntry {
-            computation,
-            first_view_entry,
-            label: Some("Map format"),
-            next_instance: None,
-        });
+            let first_view_entry = self.push_views(&[view]);
+            let next_command = self.command_list.push(CommandEntry {
+                computation,
+                first_view_entry,
+                label: Some("Map format"),
+                next_instance: None,
+            });
 
-        self.update_first_last_command_entries(next_command);
+            self.update_first_last_command_entries(next_command);
 
-        Mapped {
-            inner,
-            view: view.view.clone(),
-            marker: PhantomData,
+            Mapped {
+                inner,
+                view: view.view.clone(),
+                marker: PhantomData,
+            }
         }
     }
 
@@ -280,59 +288,70 @@ impl CommandBuffer {
         &mut self,
         descriptor: CommandDescriptor<impl Send + Sync + FnOnce(CommandContext)>,
     ) {
-        let computation = SyncUnsafeCell::new(Some(Computation::Execute {
-            command: self
-                .command_list
-                .push(SyncUnsafeCell::new(Some(descriptor.command))),
-        }));
-        let first_view_entry = self.push_views(descriptor.views);
-        let next_command = self.command_list.push(CommandEntry {
-            computation,
-            first_view_entry,
-            label: descriptor.label,
-            next_instance: None,
-        });
-        self.update_first_last_command_entries(next_command);
+        unsafe {
+            let computation = SyncUnsafeCell::new(Some(Computation::Execute {
+                command: self
+                    .command_list
+                    .push(SyncUnsafeCell::new(Some(descriptor.command))),
+            }));
+            let first_view_entry = self.push_views(descriptor.views);
+            let next_command = self.command_list.push(CommandEntry {
+                computation,
+                first_view_entry,
+                label: descriptor.label,
+                next_instance: None,
+            });
+            self.update_first_last_command_entries(next_command);
+        }
     }
 
     /// Creates a linked list of views in the command list.
     fn push_views(&mut self, list: &[&dyn ViewUsage]) -> Option<DynEntry<ViewEntry>> {
-        let mut view_iter = list.iter();
-        if let Some(first) = view_iter.next() {
-            let view = first.add_to_list(&mut self.command_list);
-            let first_entry = self.command_list.push(ViewEntry {
-                next_instance: None,
-                view,
-            });
-            let mut previous_entry = first_entry;
-
-            for to_add in view_iter {
-                let view = to_add.add_to_list(&mut self.command_list);
-                let next_entry = self.command_list.push(ViewEntry {
+        unsafe {
+            let mut view_iter = list.iter();
+            if let Some(first) = view_iter.next() {
+                let view = first.add_to_list(&mut self.command_list);
+                let first_entry = self.command_list.push(ViewEntry {
                     next_instance: None,
                     view,
                 });
+                let mut previous_entry = first_entry;
 
-                self.command_list[previous_entry].next_instance = Some(next_entry);
-                previous_entry = next_entry;
+                for to_add in view_iter {
+                    let view = to_add.add_to_list(&mut self.command_list);
+                    let next_entry = self.command_list.push(ViewEntry {
+                        next_instance: None,
+                        view,
+                    });
+
+                    self.command_list
+                        .get_unchecked_mut(previous_entry)
+                        .next_instance = Some(next_entry);
+                    previous_entry = next_entry;
+                }
+
+                Some(first_entry)
+            } else {
+                None
             }
-
-            Some(first_entry)
-        } else {
-            None
         }
     }
 
     /// Updates the first and last command entries after the provided command
     /// has been added to the command list.
-    fn update_first_last_command_entries(&mut self, next_command: DynEntry<CommandEntry>) {
-        if self.first_command_entry.is_none() {
-            self.first_command_entry = Some(next_command);
-        } else if let Some(entry) = self.last_command_entry {
-            self.command_list[entry].next_instance = Some(next_command);
+    ///
+    /// # Safety
+    ///
+    /// The `self.last_command_entry` field, if `Some`, must refer to a valid command list value.
+    unsafe fn update_first_last_command_entries(&mut self, next_command: DynEntry<CommandEntry>) {
+        unsafe {
+            if self.first_command_entry.is_none() {
+                self.first_command_entry = Some(next_command);
+            } else if let Some(entry) = self.last_command_entry {
+                self.command_list.get_unchecked_mut(entry).next_instance = Some(next_command);
+            }
+            self.last_command_entry = Some(next_command);
         }
-
-        self.last_command_entry = Some(next_command);
     }
 }
 
@@ -654,11 +673,15 @@ impl DataFrostContext {
                 if !query.complete {
                     let mut inner = self.inner();
                     while !mapping.inner.map_state.get().complete {
-                        if inner.top_level_nodes.get(query.node) {
-                            inner.critical_top_level_nodes.set(query.node, false);
-                            inner.top_level_nodes.set(query.node, false);
-                            inner.compute_graph[query.node].computation =
-                                Computation::Map { inner: None };
+                        if inner.top_level_nodes.get_unchecked(query.node) {
+                            inner
+                                .critical_top_level_nodes
+                                .set_unchecked(query.node, false);
+                            inner.top_level_nodes.set_unchecked(query.node, false);
+                            inner
+                                .compute_graph
+                                .get_unchecked_mut(query.node)
+                                .computation = Computation::Map { inner: None };
                             *mapping.inner.command_context.get() = MaybeUninit::new(
                                 inner.create_command_context(&self.holder, query.node),
                             );
@@ -1142,11 +1165,11 @@ impl ContextInner {
             }
 
             if let FormatDeriveState::Base { derived_formats } =
-                &mut self.objects[id as usize].derive_state
+                &mut self.objects.get_unchecked_mut(id as usize).derive_state
             {
                 *derived_formats = derived_states;
             } else {
-                unreachable!()
+                unreachable_unchecked()
             }
 
             let inner = Arc::new(DataInner {
@@ -1180,30 +1203,39 @@ impl ContextInner {
     }
 
     /// Creates a command context to execute the provided computation.
+    ///
+    /// # Safety
+    ///
+    /// The command ID must refer to a vald node in the compute graph.
     fn create_command_context(
         &self,
         context: &Arc<ContextHolder>,
         command_id: NodeId,
     ) -> CommandContext {
-        let computation = &self.compute_graph[command_id];
-        CommandContext {
-            inner: ManuallyDrop::new(CommandContextInner {
-                command_id,
-                command_buffer_label: self.active_command_buffers
-                    [computation.command_buffer as usize]
-                    .label,
-                context: context.clone(),
-                label: computation.label,
-                views: computation
-                    .views
-                    .iter()
-                    .map(|x| CommandContextView {
-                        id: x.id,
-                        mutable: x.mutable,
-                        value: RwCell::new(self.objects[x.id as usize].value.get().cast()),
-                    })
-                    .collect(),
-            }),
+        unsafe {
+            let computation = self.compute_graph.get_unchecked(command_id);
+            CommandContext {
+                inner: ManuallyDrop::new(CommandContextInner {
+                    command_id,
+                    command_buffer_label: self
+                        .active_command_buffers
+                        .get_unchecked(computation.command_buffer as usize)
+                        .label,
+                    context: context.clone(),
+                    label: computation.label,
+                    views: computation
+                        .views
+                        .iter()
+                        .map(|x| CommandContextView {
+                            id: x.id,
+                            mutable: x.mutable,
+                            value: RwCell::new(
+                                self.objects.get_unchecked(x.id as usize).value.get().cast(),
+                            ),
+                        })
+                        .collect(),
+                }),
+            }
         }
     }
 
@@ -1216,22 +1248,27 @@ impl ContextInner {
         unsafe {
             if let Some(node) = self.pop_command::<CRITICAL_ONLY>() {
                 let ctx = self.create_command_context(context, node);
-                let computation = &mut self.compute_graph[node];
+                let computation = self.compute_graph.get_unchecked_mut(node);
 
                 match &mut computation.computation {
                     Computation::Execute { command } => {
                         let command = *command;
-                        let command_buffer = self.active_command_buffers
-                            [computation.command_buffer as usize]
+                        let command_buffer = self
+                            .active_command_buffers
+                            .get_unchecked(computation.command_buffer as usize)
                             .command_list
                             .clone();
-                        Some(Some(Box::new(move || command_buffer[command].execute(ctx))))
+                        Some(Some(Box::new(move || {
+                            command_buffer.get_unchecked(command).execute(ctx)
+                        })))
                     }
                     Computation::Map { inner } => {
                         let value = take(inner).unwrap_unchecked();
                         *value.command_context.get() = MaybeUninit::new(ctx);
                         value.map_state.set_complete();
 
+                        // If command context must immediately be dropped,
+                        // then drop it without reacquiring mutex.
                         if let Some(mut value) = Arc::into_inner(value) {
                             self.complete_command(node, context);
                             let command_context = value.command_context.get_mut().assume_init_mut();
@@ -1243,7 +1280,7 @@ impl ContextInner {
                     }
                     Computation::Update { object, updates } => {
                         let derived = *object;
-                        let value = &self.objects[derived as usize];
+                        let value = self.objects.get_unchecked(derived as usize);
                         let FormatDeriveState::Derived {
                             updater,
                             parent,
@@ -1251,7 +1288,7 @@ impl ContextInner {
                             ..
                         } = &value.derive_state
                         else {
-                            unreachable!()
+                            unreachable_unchecked()
                         };
 
                         let parent = *parent as usize;
@@ -1259,11 +1296,11 @@ impl ContextInner {
                         let updater = updater.clone();
 
                         let format_state = if let FormatDeriveState::Base { derived_formats } =
-                            &mut self.objects[parent].derive_state
+                            &mut self.objects.get_unchecked_mut(parent).derive_state
                         {
-                            &mut derived_formats[index]
+                            derived_formats.get_unchecked_mut(index)
                         } else {
-                            unreachable!()
+                            unreachable_unchecked()
                         };
 
                         if format_state.next_update == Some(node) {
@@ -1274,7 +1311,9 @@ impl ContextInner {
                         Some(Some(Box::new(move || {
                             let mut update_list = Vec::with_capacity(updates.len());
                             update_list.extend(
-                                updates.iter().map(|(buffer, entry)| buffer[*entry].usage()),
+                                updates
+                                    .iter()
+                                    .map(|(buffer, entry)| buffer.get_unchecked(*entry).usage()),
                             );
                             updater.update(ctx, &update_list[..] as *const _);
                         })))
@@ -1293,26 +1332,28 @@ impl ContextInner {
     /// Determines the next command to schedule, removes it from the graph,
     /// and returns it. Prioritizes critical nodes.
     fn pop_command<const CRITICAL_ONLY: bool>(&mut self) -> Option<NodeId> {
-        if let Some(node) = self.critical_top_level_nodes.first_set_node() {
-            debug_assert!(
-                self.compute_graph.parents(node).next().is_none(),
-                "Attempted to pop non-parent node."
-            );
-            self.critical_top_level_nodes.set(node, false);
-            self.top_level_nodes.set(node, false);
-            Some(node)
-        } else if let Some(node) = (!CRITICAL_ONLY)
-            .then(|| self.top_level_nodes.first_set_node())
-            .flatten()
-        {
-            debug_assert!(
-                self.compute_graph.parents(node).next().is_none(),
-                "Attempted to pop non-parent node."
-            );
-            self.top_level_nodes.set(node, false);
-            Some(node)
-        } else {
-            None
+        unsafe {
+            if let Some(node) = self.critical_top_level_nodes.first_set_node() {
+                debug_assert!(
+                    self.compute_graph.parents(node).next().is_none(),
+                    "Attempted to pop non-parent node."
+                );
+                self.critical_top_level_nodes.set_unchecked(node, false);
+                self.top_level_nodes.set_unchecked(node, false);
+                Some(node)
+            } else if let Some(node) = (!CRITICAL_ONLY)
+                .then(|| self.top_level_nodes.first_set_node())
+                .flatten()
+            {
+                debug_assert!(
+                    self.compute_graph.parents(node).next().is_none(),
+                    "Attempted to pop non-parent node."
+                );
+                self.top_level_nodes.set_unchecked(node, false);
+                Some(node)
+            } else {
+                None
+            }
         }
     }
 
@@ -1332,8 +1373,11 @@ impl ContextInner {
 
                 let mut command_entry = Some(first_entry);
                 while let Some(entry) = command_entry {
-                    let next = &self.active_command_buffers[command_buffer_id as usize]
-                        .command_list[entry];
+                    let next = self
+                        .active_command_buffers
+                        .get_unchecked(command_buffer_id as usize)
+                        .command_list
+                        .get_unchecked(entry);
                     command_entry = next.next_instance;
                     added_top_level_node |= self.schedule_command(
                         command_buffer_id,
@@ -1369,19 +1413,21 @@ impl ContextInner {
         first_view_entry: Option<DynEntry<ViewEntry>>,
     ) -> bool {
         unsafe {
-            let command_buffer = self.active_command_buffers[command_buffer_id as usize]
+            let command_buffer = self
+                .active_command_buffers
+                .get_unchecked(command_buffer_id as usize)
                 .command_list
                 .clone();
             let node = self.compute_graph.vacant_node();
-            // Iterate over all used views to find any conflicting computations
 
+            // Iterate over all used views to find any conflicting computations
             self.temporary_node_buffer.clear();
             let mut views = Vec::new();
             let mut view_entry = first_view_entry;
 
             while let Some(entry) = view_entry {
-                let next = &command_buffer[entry];
-                let next_view = &command_buffer[next.view];
+                let next = command_buffer.get_unchecked(entry);
+                let next_view = command_buffer.get_unchecked(next.view);
                 assert!(
                     next_view.context_id() == self.context_id,
                     "View did not belong to this context."
@@ -1393,7 +1439,7 @@ impl ContextInner {
                 });
 
                 view_entry = next.next_instance;
-                let object = &mut self.objects[next_view.id() as usize];
+                let object = self.objects.get_unchecked_mut(next_view.id() as usize);
 
                 // Determine which other commands are dependencies of this one
                 for computation in object.mutable_references.iter().copied() {
@@ -1413,15 +1459,19 @@ impl ContextInner {
                             FormattedLabel(" ", label, ""),
                             FormattedLabel(" ", command_buffer_label, ""));
 
-                        if let Some(derived) = &self.compute_graph[computation].derived_update {
+                        if let Some(derived) =
+                            &self.compute_graph.get_unchecked(computation).derived_update
+                        {
                             if derived.parent == next_view.id() {
                                 let FormatDeriveState::Base { derived_formats } =
                                     &mut object.derive_state
                                 else {
-                                    unreachable!()
+                                    unreachable_unchecked()
                                 };
 
-                                if derived_formats[derived.index as usize].next_update
+                                if derived_formats
+                                    .get_unchecked(derived.index as usize)
+                                    .next_update
                                     == Some(computation)
                                 {
                                     continue;
@@ -1443,7 +1493,7 @@ impl ContextInner {
             }
 
             // Add the new computation to the graph
-            self.compute_graph.insert(
+            self.compute_graph.insert_unchecked(
                 ComputationNode {
                     computation: computation.clone(),
                     command_buffer: command_buffer_id,
@@ -1455,23 +1505,27 @@ impl ContextInner {
             );
 
             // Update any derived views that this command affects
-            for i in 0..self.compute_graph[node].views.len() {
-                let view = &self.compute_graph[node].views[i];
+            for i in 0..self.compute_graph.get_unchecked(node).views.len() {
+                let view = &self
+                    .compute_graph
+                    .get_unchecked(node)
+                    .views
+                    .get_unchecked(i);
                 let view_id = view.id;
                 let view_holder = view.view_holder;
                 let mutable = view.mutable;
-                let object = &mut self.objects[view.id as usize];
+                let object = self.objects.get_unchecked_mut(view.id as usize);
                 let mut derived_nodes_to_add = Vec::new();
                 match &mut object.derive_state {
                     FormatDeriveState::Base { derived_formats } => {
                         if mutable {
                             for (index, format) in derived_formats.iter_mut().enumerate() {
                                 let derived = if let Some(derived) = format.next_update {
-                                    self.compute_graph.add_parent(node, derived);
-                                    self.top_level_nodes.set(derived, false);
+                                    self.compute_graph.add_parent_unchecked(node, derived);
+                                    self.top_level_nodes.set_unchecked(derived, false);
                                     derived
                                 } else {
-                                    let derived_computation = self.compute_graph.insert(
+                                    let derived_computation = self.compute_graph.insert_unchecked(
                                         ComputationNode {
                                             computation: Computation::Update {
                                                 object: format.id,
@@ -1501,15 +1555,16 @@ impl ContextInner {
                                     format.next_update = Some(derived_computation);
                                     object.immutable_references.push(derived_computation);
                                     derived_nodes_to_add.push((format.id, derived_computation));
-                                    self.active_command_buffers[command_buffer_id as usize]
+                                    self.active_command_buffers
+                                        .get_unchecked_mut(command_buffer_id as usize)
                                         .remaining_commands += 1;
                                     derived_computation
                                 };
 
                                 let Computation::Update { updates, .. } =
-                                    &mut self.compute_graph[derived].computation
+                                    &mut self.compute_graph.get_unchecked_mut(derived).computation
                                 else {
-                                    unreachable!();
+                                    unreachable_unchecked()
                                 };
 
                                 updates.push((command_buffer.clone(), view_holder));
@@ -1518,17 +1573,22 @@ impl ContextInner {
                     }
                     &mut FormatDeriveState::Derived { parent, index, .. } => {
                         if let FormatDeriveState::Base { derived_formats } =
-                            &mut self.objects[parent as usize].derive_state
+                            &mut self.objects.get_unchecked_mut(parent as usize).derive_state
                         {
-                            derived_formats[index as usize].next_update = None;
+                            derived_formats
+                                .get_unchecked_mut(index as usize)
+                                .next_update = None;
                         } else {
-                            unreachable!();
+                            unreachable_unchecked()
                         }
                     }
                 }
 
                 for (id, node) in derived_nodes_to_add {
-                    self.objects[id as usize].mutable_references.push(node);
+                    self.objects
+                        .get_unchecked_mut(id as usize)
+                        .mutable_references
+                        .push(node);
                 }
             }
 
@@ -1536,7 +1596,7 @@ impl ContextInner {
             self.critical_nodes.resize_for(&self.compute_graph);
 
             let top_level = if self.temporary_node_buffer.is_empty() {
-                self.top_level_nodes.set(node, true);
+                self.top_level_nodes.set_unchecked(node, true);
                 true
             } else {
                 false
@@ -1552,57 +1612,61 @@ impl ContextInner {
                 self.mark_critical(node);
             }
 
-            self.active_command_buffers[command_buffer_id as usize].remaining_commands += 1;
+            self.active_command_buffers
+                .get_unchecked_mut(command_buffer_id as usize)
+                .remaining_commands += 1;
 
             top_level
         }
     }
 
     /// Marks the provided node, and all of its parents, as critical.
-    fn mark_critical(&mut self, node: NodeId) {
-        self.critical_nodes.set(node, true);
+    ///
+    /// # Safety
+    ///
+    /// For this function call to be sound, node must refer to a valid
+    /// node in the computation graph.
+    unsafe fn mark_critical(&mut self, node: NodeId) {
+        self.critical_nodes.set_unchecked(node, true);
         while let Some(parent) = self.temporary_node_buffer.pop() {
-            if !self.critical_nodes.get(parent) {
+            if !self.critical_nodes.get_unchecked(parent) {
                 self.temporary_node_buffer
                     .extend(self.compute_graph.parents(parent));
-                self.critical_nodes.set(parent, true);
+                self.critical_nodes.set_unchecked(parent, true);
             }
         }
     }
 
     /// Marks a command as complete and removes it from the node graph.
-    fn complete_command(&mut self, id: NodeId, context: &ContextHolder) {
+    unsafe fn complete_command(&mut self, id: NodeId, context: &ContextHolder) {
         self.temporary_node_buffer.clear();
         self.temporary_node_buffer
-            .extend(self.compute_graph.children(id));
-        self.critical_nodes.set(id, false);
-        let computation = self.compute_graph.pop(id);
+            .extend(self.compute_graph.children_unchecked(id));
+        self.critical_nodes.set_unchecked(id, false);
+        let computation = self.compute_graph.pop_unchecked(id);
 
         for child in self.temporary_node_buffer.iter().copied() {
-            if self.compute_graph.parents(child).next().is_none() {
-                self.top_level_nodes.set(child, true);
+            if self.compute_graph.parents_unchecked(child).next().is_none() {
+                self.top_level_nodes.set_unchecked(child, true);
             }
         }
 
         for view in computation.views {
-            let object = &mut self.objects[view.id as usize];
+            let object = self.objects.get_unchecked_mut(view.id as usize);
             let view_vec = if view.mutable {
                 &mut object.mutable_references
             } else {
                 &mut object.immutable_references
             };
-            view_vec.swap_remove(
-                view_vec
-                    .iter()
-                    .position(|x| *x == id)
-                    .expect("Failed to remove node from references list."),
-            );
+            view_vec.swap_remove(view_vec.iter().position(|x| *x == id).unwrap_unchecked());
         }
 
         self.critical_top_level_nodes
             .and(&self.top_level_nodes, &self.critical_nodes);
 
-        let command_list = &mut self.active_command_buffers[computation.command_buffer as usize];
+        let command_list = self
+            .active_command_buffers
+            .get_unchecked_mut(computation.command_buffer as usize);
         command_list.remaining_commands -= 1;
         if command_list.remaining_commands == 0 {
             self.active_command_buffers
@@ -1616,17 +1680,19 @@ impl ContextInner {
 
     /// Updates the objects of this context, discarding any which have been dropped.
     fn update_objects(&mut self) {
-        while let Ok(update) = self.object_updates.try_recv() {
-            match update {
-                ObjectUpdate::DropData { id } => {
-                    let FormatDeriveState::Base { derived_formats } =
-                        self.objects.remove(id as usize).derive_state
-                    else {
-                        unreachable!()
-                    };
+        unsafe {
+            while let Ok(update) = self.object_updates.try_recv() {
+                match update {
+                    ObjectUpdate::DropData { id } => {
+                        let FormatDeriveState::Base { derived_formats } =
+                            self.objects.remove(id as usize).derive_state
+                        else {
+                            unreachable_unchecked()
+                        };
 
-                    for format in derived_formats {
-                        self.objects.remove(format.id as usize);
+                        for format in derived_formats {
+                            self.objects.remove(format.id as usize);
+                        }
                     }
                 }
             }
@@ -1846,8 +1912,15 @@ impl<F: Format, D: DerivedDescriptor<F>> DerivedFormatUpdater for TypedDerivedFo
 
     unsafe fn update(&self, context: CommandContext, usages: *const [*const ()]) {
         self.descriptor.update(
-            &mut *context.inner.views[1].value.borrow().cast(),
-            &*context.inner.views[0].value.borrow().cast_const().cast(),
+            &mut *context.inner.views.get_unchecked(1).value.borrow().cast(),
+            &*context
+                .inner
+                .views
+                .get_unchecked(0)
+                .value
+                .borrow()
+                .cast_const()
+                .cast(),
             &*transmute::<_, *const [_]>(usages),
         );
     }

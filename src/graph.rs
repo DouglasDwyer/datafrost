@@ -48,7 +48,11 @@ impl<T> DirectedAcyclicGraph<T> {
     }
 
     /// Inserts the provided node into the graph, with the given parents.
-    pub fn insert(&mut self, value: T, parents: &[NodeId]) -> NodeId {
+    ///
+    /// # Safety
+    ///
+    /// Each node in the parents array must be a valid node in the graph.
+    pub unsafe fn insert_unchecked(&mut self, value: T, parents: &[NodeId]) -> NodeId {
         let node = self.vacant_node();
 
         let mut first_parent = u16::MAX;
@@ -75,17 +79,22 @@ impl<T> DirectedAcyclicGraph<T> {
         self.nodes.is_empty()
     }
 
-    /// Removes a node from the graph. The node is assumed to have no parents.
-    pub fn pop(&mut self, node: NodeId) -> T {
+    /// Removes a node from the graph without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The node must be a valid object in this graph, and must not
+    /// have any children.
+    pub unsafe fn pop_unchecked(&mut self, node: NodeId) -> T {
         let result = self.nodes.remove(node.0 as usize);
-        assert!(
+        debug_assert!(
             result.first_parent_entry == u16::MAX,
             "Cannot pop node that has dependencies."
         );
 
         let mut current_entry = result.first_child_entry;
         while current_entry != u16::MAX {
-            let relative = self.relatives[current_entry as usize];
+            let relative = *self.relatives.get_unchecked(current_entry as usize);
             self.relatives.remove(current_entry as usize);
             self.remove_parent_from_child(node, relative.node);
             current_entry = relative.next_entry;
@@ -94,11 +103,16 @@ impl<T> DirectedAcyclicGraph<T> {
         result.value
     }
 
-    /// Gets the children of the given node.
-    pub fn children(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
+    /// Gets the children of the given node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// For this function call to be sound, the node must be a valid
+    /// object in this graph.
+    pub unsafe fn children_unchecked(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
         DirectedAcyclicGraphIter {
             graph: self,
-            current_entry: self.nodes[node.0 as usize].first_child_entry,
+            current_entry: self.nodes.get_unchecked(node.0 as usize).first_child_entry,
         }
     }
 
@@ -110,9 +124,25 @@ impl<T> DirectedAcyclicGraph<T> {
         }
     }
 
-    /// Adds a parent to the provided node. It is a logical error for
-    /// this operation to create a cycle.
-    pub fn add_parent(&mut self, parent: NodeId, node: NodeId) {
+    /// Gets the parents of the given node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The node must refer to a valid object in the graph.
+    pub unsafe fn parents_unchecked(&self, node: NodeId) -> impl '_ + Iterator<Item = NodeId> {
+        DirectedAcyclicGraphIter {
+            graph: self,
+            current_entry: self.nodes.get_unchecked(node.0 as usize).first_parent_entry,
+        }
+    }
+
+    /// Adds a parent to the provided node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The parent and child must refer to valid objects in the graph.
+    /// Adding the parent relationship must not form a cycle.
+    pub unsafe fn add_parent_unchecked(&mut self, parent: NodeId, node: NodeId) {
         self.add_child_to_parent(parent, node);
         let node = &mut self.nodes[node.0 as usize];
         let new_entry = self.relatives.insert(NodeListEntry {
@@ -122,9 +152,32 @@ impl<T> DirectedAcyclicGraph<T> {
         node.first_parent_entry = new_entry as u16;
     }
 
+    /// Gets a reference to the provided node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The provided node must be within bounds.
+    pub unsafe fn get_unchecked(&self, node: NodeId) -> &T {
+        &self.nodes.get_unchecked(node.0 as usize).value
+    }
+
+    /// Gets a mutable reference to the provided node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The provided node must be within bounds.
+    pub unsafe fn get_unchecked_mut(&mut self, node: NodeId) -> &mut T {
+        &mut self.nodes.get_unchecked_mut(node.0 as usize).value
+    }
+
     /// Adds the provided child to the front of the parent's child list.
-    fn add_child_to_parent(&mut self, parent: NodeId, node: NodeId) {
-        let parent_node = &mut self.nodes[parent.0 as usize];
+    ///
+    /// # Safety
+    ///
+    /// The parent and child must refer to valid objects in the graph.
+    /// Adding the parent-child relationship must not create a cycle.
+    unsafe fn add_child_to_parent(&mut self, parent: NodeId, node: NodeId) {
+        let parent_node = self.nodes.get_unchecked_mut(parent.0 as usize);
         let new_entry = self.relatives.insert(NodeListEntry {
             node,
             next_entry: parent_node.first_child_entry,
@@ -133,16 +186,23 @@ impl<T> DirectedAcyclicGraph<T> {
     }
 
     /// Removes the provided parent from the child's parent list.
-    fn remove_parent_from_child(&mut self, parent: NodeId, node: NodeId) {
-        let mut last_entry = &mut self.nodes[node.0 as usize].first_parent_entry;
-        let mut next_entry = self.relatives[*last_entry as usize];
+    ///
+    /// # Safety
+    ///
+    /// The parent and child must refer to valid nodes in the graph, with
+    /// a dependency between them.
+    unsafe fn remove_parent_from_child(&mut self, parent: NodeId, node: NodeId) {
+        let mut last_entry = &mut self
+            .nodes
+            .get_unchecked_mut(node.0 as usize)
+            .first_parent_entry;
+        let mut next_entry = *self.relatives.get_unchecked(*last_entry as usize);
 
         while next_entry.node != parent {
             let key = *last_entry;
             let (current, next) = self
                 .relatives
-                .get2_mut(key as usize, next_entry.next_entry as usize)
-                .expect("Failed to get relative nodes.");
+                .get2_unchecked_mut(key as usize, next_entry.next_entry as usize);
             next_entry = *next;
             last_entry = &mut current.next_entry;
         }
@@ -185,11 +245,16 @@ impl<'a, T> Iterator for DirectedAcyclicGraphIter<'a, T> {
     type Item = NodeId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        (self.current_entry != u16::MAX).then(|| {
-            let value = self.graph.relatives[self.current_entry as usize];
-            self.current_entry = value.next_entry;
-            value.node
-        })
+        unsafe {
+            (self.current_entry != u16::MAX).then(|| {
+                let value = self
+                    .graph
+                    .relatives
+                    .get_unchecked(self.current_entry as usize);
+                self.current_entry = value.next_entry;
+                value.node
+            })
+        }
     }
 }
 
@@ -215,14 +280,24 @@ impl DirectedAcyclicGraphFlags {
             .resize(self.flags.len().max(graph.nodes.capacity()), false);
     }
 
-    /// Sets a flag on the provided node.
-    pub fn set(&mut self, node: NodeId, value: bool) -> bool {
-        self.flags.replace(node.0 as usize, value)
+    /// Sets a flag on the provided node without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// For this call to be sound, the given node must be within the bounds
+    /// of the flags array.
+    pub unsafe fn set_unchecked(&mut self, node: NodeId, value: bool) -> bool {
+        self.flags.replace_unchecked(node.0 as usize, value)
     }
 
-    /// Gets the flag associated with the provided node.
-    pub fn get(&self, node: NodeId) -> bool {
-        self.flags[node.0 as usize]
+    /// Gets the flag associated with the provided node, without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// For this call to be sound, the given node must be within the bounds
+    /// of the flags array.
+    pub unsafe fn get_unchecked(&self, node: NodeId) -> bool {
+        *self.flags.get_unchecked(node.0 as usize)
     }
 
     /// Gets the first node in this set, if any.
