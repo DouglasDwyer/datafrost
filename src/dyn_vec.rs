@@ -119,8 +119,8 @@ impl DynVec {
         #[cfg(not(debug_assertions))]
         {
             &*from_raw_parts(
-                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
-                metadata(index.offset),
+                self.inner.add(value.offset.cast::<u8>() as usize).cast(),
+                metadata(value.offset),
             )
         }
     }
@@ -140,8 +140,8 @@ impl DynVec {
         #[cfg(not(debug_assertions))]
         {
             &mut *from_raw_parts_mut(
-                self.inner.add(index.offset.cast::<u8>() as usize).cast(),
-                metadata(index.offset),
+                self.inner.add(value.offset.cast::<u8>() as usize).cast(),
+                metadata(value.offset),
             )
         }
     }
