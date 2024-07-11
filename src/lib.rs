@@ -561,6 +561,14 @@ impl<K: Kind> Deref for Data<K> {
     }
 }
 
+impl<K: Kind> PartialEq for Data<K> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl<K: Kind> Eq for Data<K> {}
+
 /// Manages a collection of formatted data, coordinates the execution of commands
 /// against the data, and automatically updates derived formats using the results
 /// of those commands.
@@ -860,6 +868,14 @@ impl<F: Format> Deref for View<F> {
         &self.inner.inner.descriptor
     }
 }
+
+impl<F: Format> PartialEq for View<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl<F: Format> Eq for View<F> {}
 
 /// Declares how a command will use a view. Created by calling [`View::as_const`]
 /// or [`View::as_mut`].
